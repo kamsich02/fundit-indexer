@@ -1,8 +1,8 @@
 // src/services/blockchain.js
 const ethers = require('ethers')
 const db = require('../db');
-const mainChainABI = require('../../config/abis/mainChainABI.json');
-const remoteChainABI = require('../../config/abis/remoteChainABI.json');
+const mainChainABI = require('../config/mainChainABI.json');
+const remoteChainABI = require('../config/remoteChainABI.json');
 
 // Network configurations
 const NETWORKS = {
