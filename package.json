@@ -1,0 +1,26 @@
+{
+  "name": "fundit-indexer",
+  "version": "1.0.0",
+  "description": "Blockchain indexer for Fundit dApp",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "worker": "node worker.js",
+    "migrate": "node migrations/runner.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "pg": "^8.13.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=23.8.0"
+  }
+}
