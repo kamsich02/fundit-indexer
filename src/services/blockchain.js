@@ -1,8 +1,47 @@
 // src/services/blockchain.js
-const ethers = require('ethers')
+const ethers = require('ethers');
 const db = require('../db');
 const mainChainABI = require('../config/mainChainABI.json');
 const remoteChainABI = require('../config/remoteChainABI.json');
+const { createLogger, format, transports } = require('winston');
+
+// Logger configuration
+const logger = createLogger({
+  level: 'info',
+  format: format.combine(
+    format.timestamp(),
+    format.errors({ stack: true }),
+    format.splat(),
+    format.json()
+  ),
+  defaultMeta: { service: 'blockchain-indexer' },
+  transports: [
+    new transports.Console({
+      format: format.combine(
+        format.colorize(),
+        format.printf(({ level, message, timestamp, service, ...meta }) => {
+          return `${timestamp} [${service}] ${level}: ${message} ${Object.keys(meta).length ? JSON.stringify(meta) : ''}`;
+        })
+      )
+    }),
+    new transports.File({ filename: 'logs/error.log', level: 'error' }),
+    new transports.File({ filename: 'logs/combined.log' })
+  ]
+});
+
+// Constants
+const STABLE_TOKEN_DECIMALS = 8; // Can be configured based on token
+const MAX_BLOCK_RANGE = 10000; // Maximum block range to process at once
+const MAX_RETRY_COUNT = 3; // Maximum number of retries for RPC calls
+const RETRY_DELAY_MS = 2000; // Delay between retries
+
+// Performance metrics
+const metrics = {
+  eventsProcessed: { campaigns: 0, donations: 0, withdrawals: 0 },
+  dbOperations: 0,
+  errors: 0,
+  processingTimeMs: 0
+};
 
 // Network configurations
 const NETWORKS = {
@@ -54,94 +93,242 @@ const NETWORKS = {
   // Add other networks...
 };
 
-// Create providers and contracts
+// Validate environment variables
+function validateEnvironment() {
+  const issues = [];
+  
+  Object.entries(NETWORKS).forEach(([network, config]) => {
+    if (!config.rpc) {
+      issues.push(`Missing RPC URL for ${network}`);
+    }
+    if (!config.contractAddress) {
+      issues.push(`Missing contract address for ${network}`);
+    }
+  });
+  
+  if (issues.length > 0) {
+    logger.error(`Environment validation failed`, { issues });
+    throw new Error(`Environment validation failed: ${issues.join(', ')}`);
+  }
+  
+  logger.info('Environment validation successful');
+}
+
+// Create providers and contracts with validation
 const providers = {};
 const contracts = {};
 
-Object.entries(NETWORKS).forEach(([network, config]) => {
-  providers[network] = new ethers.JsonRpcProvider({url: config.rpc});
-  contracts[network] = new ethers.Contract(
-    config.contractAddress,
-    config.isMain ? mainChainABI : remoteChainABI,
-    providers[network]
-  );
-});
+function initializeProviders() {
+  Object.entries(NETWORKS).forEach(([network, config]) => {
+    if (!config.rpc || !config.contractAddress) {
+      logger.warn(`Skipping ${network} due to missing configuration`);
+      return;
+    }
+    
+    try {
+      providers[network] = new ethers.JsonRpcProvider(config.rpc);
+      contracts[network] = new ethers.Contract(
+        config.contractAddress,
+        config.isMain ? mainChainABI : remoteChainABI,
+        providers[network]
+      );
+      logger.info(`Initialized provider and contract for ${network}`);
+    } catch (error) {
+      logger.error(`Failed to initialize ${network}`, { 
+        error: error.message, 
+        stack: error.stack,
+        network
+      });
+    }
+  });
+}
+
+// Retry wrapper for RPC calls
+async function withRetry(fn, name, ...args) {
+  let lastError;
+  for (let attempt = 1; attempt <= MAX_RETRY_COUNT; attempt++) {
+    try {
+      logger.debug(`Attempting ${name} (try ${attempt}/${MAX_RETRY_COUNT})`);
+      const result = await fn(...args);
+      if (attempt > 1) {
+        logger.info(`${name} succeeded after ${attempt} attempts`);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      logger.warn(`${name} attempt ${attempt} failed: ${error.message}`);
+      if (attempt < MAX_RETRY_COUNT) {
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+      }
+    }
+  }
+  
+  // If we get here, all retries failed
+  logger.error(`${name} failed after ${MAX_RETRY_COUNT} attempts`);
+  throw lastError;
+}
 
 // Campaign indexing
 async function indexCampaignEvents(network, fromBlock, toBlock) {
-  console.log(`Indexing ${network} campaign events from ${fromBlock} to ${toBlock}`);
+  logger.info(`Indexing ${network} campaign events from ${fromBlock} to ${toBlock}`);
   
   if (!NETWORKS[network].isMain) {
-    console.log(`Skipping campaign events for non-main chain ${network}`);
+    logger.info(`Skipping campaign events for non-main chain ${network}`);
     return; // Only main chain has campaign events
   }
   
   const contract = contracts[network];
   const client = await db.query('BEGIN');
+  metrics.dbOperations++;
   
   try {
     // Fetch created events
     const createdFilter = contract.filters.CampaignCreated();
-    const createdEvents = await contract.queryFilter(createdFilter, fromBlock, toBlock);
+    const createdEvents = await withRetry(
+      contract.queryFilter.bind(contract), 
+      'queryFilter-CampaignCreated', 
+      createdFilter, 
+      fromBlock, 
+      toBlock
+    );
     
     // Fetch edited events
     const editedFilter = contract.filters.CampaignEdited();
-    const editedEvents = await contract.queryFilter(editedFilter, fromBlock, toBlock);
+    const editedEvents = await withRetry(
+      contract.queryFilter.bind(contract), 
+      'queryFilter-CampaignEdited',
+      editedFilter, 
+      fromBlock, 
+      toBlock
+    );
     
     // Fetch ended events
     const endedFilter = contract.filters.CampaignEnded();
-    const endedEvents = await contract.queryFilter(endedFilter, fromBlock, toBlock);
+    const endedEvents = await withRetry(
+      contract.queryFilter.bind(contract), 
+      'queryFilter-CampaignEnded',
+      endedFilter, 
+      fromBlock, 
+      toBlock
+    );
     
-    // Process created events
+    // Get all campaign IDs to fetch in batch
+    const allCampaignIds = new Set();
+    createdEvents.forEach(event => allCampaignIds.add(event.args.campaignId.toString()));
+    editedEvents.forEach(event => allCampaignIds.add(event.args.campaignId.toString()));
+    
+    // Pre-fetch campaign data in batches to avoid multiple RPC calls
+    const campaignDataMap = new Map();
+    const campaignIdsList = [...allCampaignIds];
+    
+    // Process campaign data in batches of 20 to avoid RPC limits
+    const BATCH_SIZE = 20;
+    for (let i = 0; i < campaignIdsList.length; i += BATCH_SIZE) {
+      const batch = campaignIdsList.slice(i, i + BATCH_SIZE);
+      const campaignPromises = batch.map(id => 
+        withRetry(
+          contract.campaigns.bind(contract), 
+          `fetch-campaign-${id}`, 
+          id
+        )
+      );
+      
+      const campaignResults = await Promise.all(campaignPromises);
+      batch.forEach((id, index) => {
+        campaignDataMap.set(id, campaignResults[index]);
+      });
+    }
+    
+    // Prepare batch inserts for created events
+    const createdValues = [];
+    const createdTxValues = [];
+    
     for (const event of createdEvents) {
       const campaignId = event.args.campaignId.toString();
       const creator = event.args.creator;
       
-      // Fetch campaign details from contract
-      const campaign = await contract.campaigns(campaignId);
+      // Get pre-fetched campaign data
+      const campaign = campaignDataMap.get(campaignId);
+      
+      if (!campaign) {
+        logger.warn(`Campaign data not found for ID ${campaignId}`);
+        continue;
+      }
+      
+      createdValues.push([
+        campaignId,
+        campaign.name,
+        campaign.description,
+        ethers.formatUnits(campaign.target, STABLE_TOKEN_DECIMALS),
+        campaign.socialLink,
+        campaign.imageId.toString(),
+        campaign.creator,
+        campaign.ended,
+        ethers.formatUnits(campaign.totalStable, STABLE_TOKEN_DECIMALS),
+        network,
+        event.transactionHash
+      ]);
+      
+      createdTxValues.push([
+        'Campaign Created',
+        creator,
+        campaignId,
+        network,
+        event.transactionHash
+      ]);
+    }
+    
+    // Batch insert campaigns
+    if (createdValues.length > 0) {
+      const createdParams = [];
+      const createdQueryParts = [];
+      
+      createdValues.forEach((values, i) => {
+        const offset = i * 11; // 11 params per row
+        createdQueryParts.push(`($${offset+1}, $${offset+2}, $${offset+3}, $${offset+4}, $${offset+5}, $${offset+6}, $${offset+7}, $${offset+8}, $${offset+9}, $${offset+10}, $${offset+11})`);
+        createdParams.push(...values);
+      });
       
       await client.query(
         `INSERT INTO campaigns (
           id, name, description, target_amount, social_link, image_id, 
           creator, ended, amount_raised, chain, tx_hash
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ) VALUES ${createdQueryParts.join(', ')}
         ON CONFLICT (id) DO NOTHING`,
-        [
-          campaignId,
-          campaign.name,
-          campaign.description,
-          ethers.formatUnits(campaign.target, 8),
-          campaign.socialLink,
-          campaign.imageId.toString(),
-          campaign.creator,
-          campaign.ended,
-          ethers.formatUnits(campaign.totalStable, 8),
-          network,
-          event.transactionHash
-        ]
+        createdParams
       );
+      metrics.dbOperations++;
       
-      // Record transaction
+      // Batch insert campaign created transactions
+      const createdTxParams = [];
+      const createdTxQueryParts = [];
+      
+      createdTxValues.forEach((values, i) => {
+        const offset = i * 5; // 5 params per row
+        createdTxQueryParts.push(`($${offset+1}, $${offset+2}, $${offset+3}, NOW(), $${offset+4}, $${offset+5})`);
+        createdTxParams.push(...values);
+      });
+      
       await client.query(
         `INSERT INTO transactions (
           type, user_address, campaign_id, timestamp, chain, tx_hash
-        ) VALUES ($1, $2, $3, NOW(), $4, $5)`,
-        [
-          'Campaign Created',
-          creator,
-          campaignId,
-          network,
-          event.transactionHash
-        ]
+        ) VALUES ${createdTxQueryParts.join(', ')}`,
+        createdTxParams
       );
+      metrics.dbOperations++;
     }
     
-    // Process edited events
+    // Process edited events - these need individual updates
     for (const event of editedEvents) {
       const campaignId = event.args.campaignId.toString();
       
-      // Fetch updated campaign details
-      const campaign = await contract.campaigns(campaignId);
+      // Get pre-fetched campaign data
+      const campaign = campaignDataMap.get(campaignId);
+      
+      if (!campaign) {
+        logger.warn(`Campaign data not found for ID ${campaignId} during edit`);
+        continue;
+      }
       
       await client.query(
         `UPDATE campaigns SET
@@ -155,12 +342,13 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
         [
           campaign.name,
           campaign.description,
-          ethers.formatUnits(campaign.target, 8),
+          ethers.formatUnits(campaign.target, STABLE_TOKEN_DECIMALS),
           campaign.socialLink,
           campaign.imageId.toString(),
           campaignId
         ]
       );
+      metrics.dbOperations++;
       
       // Record transaction
       await client.query(
@@ -175,13 +363,33 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
           event.transactionHash
         ]
       );
+      metrics.dbOperations++;
     }
     
-    // Process ended events
+    // Process ended events - batch processing where possible
+    const endedValues = [];
+    const endedTxValues = [];
+    
     for (const event of endedEvents) {
       const campaignId = event.args.campaignId.toString();
-      const finalAmount = ethers.formatUnits(event.args.finalStableValue, 8);
+      const finalAmount = ethers.formatUnits(event.args.finalStableValue, STABLE_TOKEN_DECIMALS);
       
+      endedValues.push([
+        finalAmount, 
+        campaignId
+      ]);
+      
+      endedTxValues.push([
+        'Campaign Ended',
+        campaignId,
+        finalAmount,
+        network,
+        event.transactionHash
+      ]);
+    }
+    
+    // Batch update campaigns
+    for (const [finalAmount, campaignId] of endedValues) {
       await client.query(
         `UPDATE campaigns SET
           ended = TRUE,
@@ -190,44 +398,78 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
         WHERE id = $2`,
         [finalAmount, campaignId]
       );
+      metrics.dbOperations++;
+    }
+    
+    // Batch insert campaign ended transactions
+    if (endedTxValues.length > 0) {
+      const endedTxParams = [];
+      const endedTxQueryParts = [];
       
-      // Record transaction
+      endedTxValues.forEach((values, i) => {
+        const offset = i * 5; // 5 params per row
+        endedTxQueryParts.push(`($${offset+1}, (SELECT creator FROM campaigns WHERE id = $${offset+2}), $${offset+2}, $${offset+3}, NOW(), $${offset+4}, $${offset+5})`);
+        endedTxParams.push(...values);
+      });
+      
       await client.query(
         `INSERT INTO transactions (
           type, user_address, campaign_id, amount, timestamp, chain, tx_hash
-        ) VALUES ($1, (SELECT creator FROM campaigns WHERE id = $2), $2, $3, NOW(), $4, $5)`,
-        [
-          'Campaign Ended',
-          campaignId,
-          finalAmount,
-          network,
-          event.transactionHash
-        ]
+        ) VALUES ${endedTxQueryParts.join(', ')}`,
+        endedTxParams
       );
+      metrics.dbOperations++;
     }
     
     // Commit all changes
     await client.query('COMMIT');
-    console.log(`Indexed ${createdEvents.length} created, ${editedEvents.length} edited, ${endedEvents.length} ended campaigns`);
+    metrics.dbOperations++;
+    
+    // Update metrics
+    metrics.eventsProcessed.campaigns += createdEvents.length + editedEvents.length + endedEvents.length;
+    
+    logger.info(`Indexed ${createdEvents.length} created, ${editedEvents.length} edited, ${endedEvents.length} ended campaigns`);
     
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error(`Error indexing ${network} campaigns:`, error);
+    metrics.dbOperations++;
+    metrics.errors++;
+    
+    logger.error(`Error indexing ${network} campaigns`, {
+      error: error.message,
+      stack: error.stack,
+      fromBlock,
+      toBlock,
+      network
+    });
+    
     throw error;
   }
 }
 
 // Donation indexing
 async function indexDonationEvents(network, fromBlock, toBlock) {
-  console.log(`Indexing ${network} donation events from ${fromBlock} to ${toBlock}`);
+  logger.info(`Indexing ${network} donation events from ${fromBlock} to ${toBlock}`);
   
   const contract = contracts[network];
   const client = await db.query('BEGIN');
+  metrics.dbOperations++;
   
   try {
     // Fetch donation events
     const donationFilter = contract.filters.DonationMade();
-    const donationEvents = await contract.queryFilter(donationFilter, fromBlock, toBlock);
+    const donationEvents = await withRetry(
+      contract.queryFilter.bind(contract), 
+      'queryFilter-DonationMade',
+      donationFilter, 
+      fromBlock, 
+      toBlock
+    );
+    
+    // Prepare batch values
+    const donationValues = [];
+    const updateCampaignValues = [];
+    const transactionValues = [];
     
     for (const event of donationEvents) {
       const args = NETWORKS[network].isMain 
@@ -245,17 +487,53 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
       
       const campaignId = args.campaignId;
       const donor = args.donor;
-      const amount = ethers.formatUnits(args.netUSDValue, 8);
+      const amount = ethers.formatUnits(args.netUSDValue, STABLE_TOKEN_DECIMALS);
       
-      // Record donation
+      donationValues.push([
+        campaignId, 
+        donor, 
+        amount, 
+        network, 
+        event.transactionHash
+      ]);
+      
+      updateCampaignValues.push([
+        amount, 
+        campaignId
+      ]);
+      
+      transactionValues.push([
+        'Donation', 
+        donor, 
+        campaignId, 
+        amount, 
+        network, 
+        event.transactionHash
+      ]);
+    }
+    
+    // Batch insert donations
+    if (donationValues.length > 0) {
+      const donationParams = [];
+      const donationQueryParts = [];
+      
+      donationValues.forEach((values, i) => {
+        const offset = i * 5; // 5 params per row
+        donationQueryParts.push(`($${offset+1}, $${offset+2}, $${offset+3}, NOW(), $${offset+4}, $${offset+5})`);
+        donationParams.push(...values);
+      });
+      
       await client.query(
         `INSERT INTO donations (
           campaign_id, donor, amount, timestamp, chain, tx_hash
-        ) VALUES ($1, $2, $3, NOW(), $4, $5)`,
-        [campaignId, donor, amount, network, event.transactionHash]
+        ) VALUES ${donationQueryParts.join(', ')}`,
+        donationParams
       );
-      
-      // Update campaign amount raised
+      metrics.dbOperations++;
+    }
+    
+    // Update campaign amounts individually to ensure consistency
+    for (const [amount, campaignId] of updateCampaignValues) {
       await client.query(
         `UPDATE campaigns SET
           amount_raised = amount_raised + $1,
@@ -263,99 +541,165 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
         WHERE id = $2`,
         [amount, campaignId]
       );
+      metrics.dbOperations++;
+    }
+    
+    // Batch insert transactions
+    if (transactionValues.length > 0) {
+      const txParams = [];
+      const txQueryParts = [];
       
-      // Record transaction
+      transactionValues.forEach((values, i) => {
+        const offset = i * 6; // 6 params per row
+        txQueryParts.push(`($${offset+1}, $${offset+2}, $${offset+3}, $${offset+4}, NOW(), $${offset+5}, $${offset+6})`);
+        txParams.push(...values);
+      });
+      
       await client.query(
         `INSERT INTO transactions (
           type, user_address, campaign_id, amount, timestamp, chain, tx_hash
-        ) VALUES ($1, $2, $3, $4, NOW(), $5, $6)`,
-        [
-          'Donation',
-          donor,
-          campaignId,
-          amount,
-          network,
-          event.transactionHash
-        ]
+        ) VALUES ${txQueryParts.join(', ')}`,
+        txParams
       );
+      metrics.dbOperations++;
     }
     
     // Commit all changes
     await client.query('COMMIT');
-    console.log(`Indexed ${donationEvents.length} donations`);
+    metrics.dbOperations++;
+    
+    // Update metrics
+    metrics.eventsProcessed.donations += donationEvents.length;
+    
+    logger.info(`Indexed ${donationEvents.length} donations`);
     
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error(`Error indexing ${network} donations:`, error);
+    metrics.dbOperations++;
+    metrics.errors++;
+    
+    logger.error(`Error indexing ${network} donations`, {
+      error: error.message,
+      stack: error.stack,
+      fromBlock,
+      toBlock,
+      network
+    });
+    
     throw error;
   }
 }
 
 // Withdrawal indexing
 async function indexWithdrawalEvents(network, fromBlock, toBlock) {
-  console.log(`Indexing ${network} withdrawal events from ${fromBlock} to ${toBlock}`);
+  logger.info(`Indexing ${network} withdrawal events from ${fromBlock} to ${toBlock}`);
   
   if (!NETWORKS[network].isMain) {
-    console.log(`Skipping withdrawal events for non-main chain ${network}`);
+    logger.info(`Skipping withdrawal events for non-main chain ${network}`);
     return; // Only main chain has withdrawal events
   }
   
   const contract = contracts[network];
   const client = await db.query('BEGIN');
+  metrics.dbOperations++;
   
   try {
     // Fetch withdrawal request events
     const requestFilter = contract.filters.WithdrawalRequested();
-    const requestEvents = await contract.queryFilter(requestFilter, fromBlock, toBlock);
+    const requestEvents = await withRetry(
+      contract.queryFilter.bind(contract), 
+      'queryFilter-WithdrawalRequested',
+      requestFilter, 
+      fromBlock, 
+      toBlock
+    );
     
     // Fetch withdrawal processed events
     const processedFilter = contract.filters.WithdrawalProcessed();
-    const processedEvents = await contract.queryFilter(processedFilter, fromBlock, toBlock);
+    const processedEvents = await withRetry(
+      contract.queryFilter.bind(contract), 
+      'queryFilter-WithdrawalProcessed',
+      processedFilter, 
+      fromBlock, 
+      toBlock
+    );
     
-    // Process request events
+    // Prepare batch values for requests
+    const requestValues = [];
+    const requestTxValues = [];
+    
     for (const event of requestEvents) {
       const requestId = event.args.requestId.toString();
       const requester = event.args.requester;
-      const amount = ethers.formatUnits(event.args.amount, 8);
+      const amount = ethers.formatUnits(event.args.amount, STABLE_TOKEN_DECIMALS);
       const token = event.args.token;
       const targetChain = event.args.targetChainId.toString();
+      
+      requestValues.push([
+        requestId,
+        requester,
+        amount,
+        token,
+        targetChain,
+        'Requested',
+        network,
+        event.transactionHash
+      ]);
+      
+      requestTxValues.push([
+        'Withdrawal Requested',
+        requester,
+        amount,
+        token,
+        targetChain,
+        network,
+        event.transactionHash
+      ]);
+    }
+    
+    // Batch insert withdrawal requests
+    if (requestValues.length > 0) {
+      const requestParams = [];
+      const requestQueryParts = [];
+      
+      requestValues.forEach((values, i) => {
+        const offset = i * 8; // 8 params per row
+        requestQueryParts.push(`($${offset+1}, $${offset+2}, $${offset+3}, $${offset+4}, $${offset+5}, $${offset+6}, NOW(), $${offset+7}, $${offset+8})`);
+        requestParams.push(...values);
+      });
       
       await client.query(
         `INSERT INTO withdrawals (
           id, user_address, amount, token, target_chain, status, 
           request_timestamp, chain, tx_hash
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8)
+        ) VALUES ${requestQueryParts.join(', ')}
         ON CONFLICT (id) DO NOTHING`,
-        [
-          requestId,
-          requester,
-          amount,
-          token,
-          targetChain,
-          'Requested',
-          network,
-          event.transactionHash
-        ]
+        requestParams
       );
+      metrics.dbOperations++;
+    }
+    
+    // Batch insert withdrawal request transactions
+    if (requestTxValues.length > 0) {
+      const requestTxParams = [];
+      const requestTxQueryParts = [];
       
-      // Record transaction
+      requestTxValues.forEach((values, i) => {
+        const offset = i * 7; // 7 params per row
+        requestTxQueryParts.push(`($${offset+1}, $${offset+2}, $${offset+3}, $${offset+4}, $${offset+5}, NOW(), $${offset+6}, $${offset+7})`);
+        requestTxParams.push(...values);
+      });
+      
       await client.query(
         `INSERT INTO transactions (
           type, user_address, amount, token, target_chain, timestamp, chain, tx_hash
-        ) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)`,
-        [
-          'Withdrawal Requested',
-          requester,
-          amount,
-          token,
-          targetChain,
-          network,
-          event.transactionHash
-        ]
+        ) VALUES ${requestTxQueryParts.join(', ')}`,
+        requestTxParams
       );
+      metrics.dbOperations++;
     }
     
-    // Process processed events
+    // Process processed events - need to be done individually due to dependencies
     for (const event of processedEvents) {
       const requestId = event.args.requestId.toString();
       
@@ -364,6 +708,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
         'SELECT * FROM withdrawals WHERE id = $1',
         [requestId]
       );
+      metrics.dbOperations++;
       
       if (withdrawal.rows.length > 0) {
         const withdrawalData = withdrawal.rows[0];
@@ -376,6 +721,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
           WHERE id = $3`,
           ['Processed', event.transactionHash, requestId]
         );
+        metrics.dbOperations++;
         
         // Record transaction
         await client.query(
@@ -392,25 +738,44 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
             event.transactionHash
           ]
         );
+        metrics.dbOperations++;
       }
     }
     
     // Commit all changes
     await client.query('COMMIT');
-    console.log(`Indexed ${requestEvents.length} withdrawal requests, ${processedEvents.length} processed withdrawals`);
+    metrics.dbOperations++;
+    
+    // Update metrics
+    metrics.eventsProcessed.withdrawals += requestEvents.length + processedEvents.length;
+    
+    logger.info(`Indexed ${requestEvents.length} withdrawal requests, ${processedEvents.length} processed withdrawals`);
     
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error(`Error indexing ${network} withdrawals:`, error);
+    metrics.dbOperations++;
+    metrics.errors++;
+    
+    logger.error(`Error indexing ${network} withdrawals`, {
+      error: error.message,
+      stack: error.stack,
+      fromBlock,
+      toBlock,
+      network
+    });
+    
     throw error;
   }
 }
 
-// Main indexing function
-async function indexNetwork(network, fromBlock, toBlock) {
-  console.log(`Starting indexing for ${network} from block ${fromBlock} to ${toBlock}`);
+// Process a chunk of blocks
+async function indexNetworkChunk(network, fromBlock, toBlock) {
+  logger.info(`Processing chunk for ${network} from block ${fromBlock} to ${toBlock}`);
   
   try {
+    // Start timer for performance metrics
+    const startTime = Date.now();
+    
     // Index campaign events (only for main chain)
     if (NETWORKS[network].isMain) {
       await indexCampaignEvents(network, fromBlock, toBlock);
@@ -424,27 +789,119 @@ async function indexNetwork(network, fromBlock, toBlock) {
       await indexWithdrawalEvents(network, fromBlock, toBlock);
     }
     
-    // Update last indexed block
-    await db.query(
-      `INSERT INTO indexer_state (chain, last_indexed_block, updated_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (chain) DO UPDATE SET
-         last_indexed_block = $2,
-         updated_at = NOW()`,
-      [network, toBlock]
-    );
+    // Calculate processing time
+    const processingTime = Date.now() - startTime;
+    metrics.processingTimeMs += processingTime;
     
-    console.log(`Completed indexing for ${network}`);
+    logger.info(`Completed chunk processing for ${network}`, {
+      fromBlock,
+      toBlock,
+      processingTimeMs: processingTime
+    });
     
     return toBlock;
   } catch (error) {
-    console.error(`Failed to index ${network}:`, error);
+    logger.error(`Failed to process chunk for ${network}`, {
+      error: error.message,
+      stack: error.stack,
+      fromBlock,
+      toBlock
+    });
     throw error;
   }
 }
 
+// Main indexing function with block range chunking
+async function indexNetwork(network, fromBlock, toBlock) {
+  logger.info(`Starting indexing for ${network} from block ${fromBlock} to ${toBlock}`);
+  
+  try {
+    // Reset metrics for this run
+    metrics.eventsProcessed = { campaigns: 0, donations: 0, withdrawals: 0 };
+    metrics.dbOperations = 0;
+    metrics.errors = 0;
+    metrics.processingTimeMs = 0;
+    
+    // Process in chunks if range is too large
+    if (toBlock - fromBlock > MAX_BLOCK_RANGE) {
+      logger.info(`Large block range detected, breaking into chunks of ${MAX_BLOCK_RANGE} blocks`);
+      
+      const chunks = [];
+      for (let i = fromBlock; i < toBlock; i += MAX_BLOCK_RANGE) {
+        chunks.push([i, Math.min(i + MAX_BLOCK_RANGE - 1, toBlock)]);
+      }
+      
+      logger.info(`Created ${chunks.length} chunks for processing`);
+      
+      let lastProcessedBlock = fromBlock;
+      for (const [chunkFrom, chunkTo] of chunks) {
+        lastProcessedBlock = await indexNetworkChunk(network, chunkFrom, chunkTo);
+      }
+      
+      // Update last indexed block
+      await db.query(
+        `INSERT INTO indexer_state (chain, last_indexed_block, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (chain) DO UPDATE SET
+           last_indexed_block = $2,
+           updated_at = NOW()`,
+        [network, lastProcessedBlock]
+      );
+      
+      logger.info(`Completed chunked indexing for ${network}`, { metrics });
+      
+      return lastProcessedBlock;
+    } else {
+      // For smaller ranges, process directly
+      const processedBlock = await indexNetworkChunk(network, fromBlock, toBlock);
+      
+      // Update last indexed block
+      await db.query(
+        `INSERT INTO indexer_state (chain, last_indexed_block, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (chain) DO UPDATE SET
+           last_indexed_block = $2,
+           updated_at = NOW()`,
+        [network, processedBlock]
+      );
+      
+      logger.info(`Completed indexing for ${network}`, { metrics });
+      
+      return processedBlock;
+    }
+  } catch (error) {
+    logger.error(`Failed to index ${network}`, {
+      error: error.message,
+      stack: error.stack,
+      fromBlock,
+      toBlock,
+      metrics
+    });
+    throw error;
+  }
+}
+
+// Get current indexer metrics
+function getMetrics() {
+  return {
+    ...metrics,
+    networks: Object.keys(NETWORKS).length,
+    activeNetworks: Object.keys(providers).length
+  };
+}
+
+// Initialize the module
+function initialize() {
+  validateEnvironment();
+  initializeProviders();
+  logger.info('Blockchain indexer initialized successfully');
+}
+
+// Export the module
 module.exports = {
+  initialize,
   indexNetwork,
+  getMetrics,
   providers,
   contracts,
   NETWORKS
