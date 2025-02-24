@@ -31,7 +31,7 @@ async function runMigrations() {
   await ensureMigrationsTable();
   
   const migrations = [
-    { name: '001_initial_schema', up: require('../migrations/001_initial_schema').up }
+    { name: '001_initial_schema', up: require('../../migrations/001_initial_schema').up }
     // Add future migrations here
   ];
   
