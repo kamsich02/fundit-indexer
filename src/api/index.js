@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const db = require('../db');
+const { getIndexerStatus } = require('../worker');
 
 const app = express();
 
@@ -12,11 +13,22 @@ app.use(express.json());
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // Limit each IP to 100 requests per window
+  windowMs: 15 * 60 * 1000,
+  max: 100
 });
 
 app.use(limiter);
+
+// Get indexer status (for real-time frontend updates)
+app.get('/api/indexer-status', async (req, res) => {
+  try {
+    const status = await getIndexerStatus();
+    res.json(status);
+  } catch (error) {
+    console.error('Error getting indexer status:', error);
+    res.status(500).json({ error: 'Failed to fetch indexer status' });
+  }
+});
 
 // Get all campaigns with pagination
 app.get('/api/campaigns', async (req, res) => {
