@@ -5,9 +5,10 @@ const mainChainABI = require('../config/mainChainABI.json');
 const remoteChainABI = require('../config/remoteChainABI.json');
 const { createLogger, format, transports } = require('winston');
 
-// Logger configuration
+// Logger configuration with production awareness
+const logLevel = process.env.NODE_ENV === 'production' ? 'warn' : 'info';
 const logger = createLogger({
-  level: 'info',
+  level: logLevel, // Only log warnings and errors in production
   format: format.combine(
     format.timestamp(),
     format.errors({ stack: true }),
@@ -20,20 +21,42 @@ const logger = createLogger({
       format: format.combine(
         format.colorize(),
         format.printf(({ level, message, timestamp, service, ...meta }) => {
-          return `${timestamp} [${service}] ${level}: ${message} ${Object.keys(meta).length ? JSON.stringify(meta) : ''}`;
+          // In production, only include metadata for errors
+          const metaStr = (level === 'error' || process.env.NODE_ENV !== 'production') && Object.keys(meta).length ? 
+            JSON.stringify(meta) : '';
+          return `${timestamp} [${service}] ${level}: ${message} ${metaStr}`;
         })
       )
     }),
-    new transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new transports.File({ filename: 'logs/combined.log' })
+    // Only log to files in non-production environment or for errors
+    ...(process.env.NODE_ENV !== 'production' ? [
+      new transports.File({ filename: 'logs/error.log', level: 'error' }),
+      new transports.File({ filename: 'logs/combined.log' })
+    ] : [
+      new transports.File({ filename: 'logs/error.log', level: 'error' })
+    ])
   ]
 });
+
+// Helper methods for selective logging
+logger.debugIf = (condition, message, meta = {}) => {
+  if (condition) {
+    logger.debug(message, meta);
+  }
+};
+
+logger.infoIf = (condition, message, meta = {}) => {
+  if (condition) {
+    logger.info(message, meta);
+  }
+};
 
 // Constants
 const STABLE_TOKEN_DECIMALS = 8; // Can be configured based on token
 const MAX_BLOCK_RANGE = 10000; // Maximum block range to process at once
 const MAX_RETRY_COUNT = 3; // Maximum number of retries for RPC calls
 const RETRY_DELAY_MS = 2000; // Delay between retries
+const IS_DEV = process.env.NODE_ENV !== 'production';
 
 // Performance metrics
 const metrics = {
@@ -148,10 +171,10 @@ async function withRetry(fn, name, ...args) {
   let lastError;
   for (let attempt = 1; attempt <= MAX_RETRY_COUNT; attempt++) {
     try {
-      logger.debug(`Attempting ${name} (try ${attempt}/${MAX_RETRY_COUNT})`);
+      logger.debugIf(IS_DEV, `Attempting ${name} (try ${attempt}/${MAX_RETRY_COUNT})`);
       const result = await fn(...args);
       if (attempt > 1) {
-        logger.info(`${name} succeeded after ${attempt} attempts`);
+        logger.infoIf(IS_DEV, `${name} succeeded after ${attempt} attempts`);
       }
       return result;
     } catch (error) {
@@ -170,10 +193,10 @@ async function withRetry(fn, name, ...args) {
 
 // Campaign indexing
 async function indexCampaignEvents(network, fromBlock, toBlock) {
-  logger.info(`Indexing ${network} campaign events from ${fromBlock} to ${toBlock}`);
+  logger.infoIf(IS_DEV, `Indexing ${network} campaign events from ${fromBlock} to ${toBlock}`);
   
   if (!NETWORKS[network].isMain) {
-    logger.info(`Skipping campaign events for non-main chain ${network}`);
+    logger.infoIf(IS_DEV, `Skipping campaign events for non-main chain ${network}`);
     return; // Only main chain has campaign events
   }
   
@@ -430,7 +453,9 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
     // Update metrics
     metrics.eventsProcessed.campaigns += createdEvents.length + editedEvents.length + endedEvents.length;
     
-    logger.info(`Indexed ${createdEvents.length} created, ${editedEvents.length} edited, ${endedEvents.length} ended campaigns`);
+    // Only log results if we found events or in development mode
+    const hasEvents = createdEvents.length > 0 || editedEvents.length > 0 || endedEvents.length > 0;
+    logger.infoIf(IS_DEV || hasEvents, `Indexed ${createdEvents.length} created, ${editedEvents.length} edited, ${endedEvents.length} ended campaigns`);
     
   } catch (error) {
     await db.query('ROLLBACK');
@@ -451,7 +476,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
 
 // Donation indexing
 async function indexDonationEvents(network, fromBlock, toBlock) {
-  logger.info(`Indexing ${network} donation events from ${fromBlock} to ${toBlock}`);
+  logger.infoIf(IS_DEV, `Indexing ${network} donation events from ${fromBlock} to ${toBlock}`);
   
   const contract = contracts[network];
   
@@ -575,7 +600,8 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
     // Update metrics
     metrics.eventsProcessed.donations += donationEvents.length;
     
-    logger.info(`Indexed ${donationEvents.length} donations`);
+    // Only log results if we found events or in development mode
+    logger.infoIf(IS_DEV || donationEvents.length > 0, `Indexed ${donationEvents.length} donations`);
     
   } catch (error) {
     await db.query('ROLLBACK');
@@ -596,10 +622,10 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
 
 // Withdrawal indexing
 async function indexWithdrawalEvents(network, fromBlock, toBlock) {
-  logger.info(`Indexing ${network} withdrawal events from ${fromBlock} to ${toBlock}`);
+  logger.infoIf(IS_DEV, `Indexing ${network} withdrawal events from ${fromBlock} to ${toBlock}`);
   
   if (!NETWORKS[network].isMain) {
-    logger.info(`Skipping withdrawal events for non-main chain ${network}`);
+    logger.infoIf(IS_DEV, `Skipping withdrawal events for non-main chain ${network}`);
     return; // Only main chain has withdrawal events
   }
   
@@ -755,7 +781,9 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
     // Update metrics
     metrics.eventsProcessed.withdrawals += requestEvents.length + processedEvents.length;
     
-    logger.info(`Indexed ${requestEvents.length} withdrawal requests, ${processedEvents.length} processed withdrawals`);
+    // Only log results if we found events or in development mode
+    const hasEvents = requestEvents.length > 0 || processedEvents.length > 0;
+    logger.infoIf(IS_DEV || hasEvents, `Indexed ${requestEvents.length} withdrawal requests, ${processedEvents.length} processed withdrawals`);
     
   } catch (error) {
     await db.query('ROLLBACK');
@@ -776,7 +804,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
 
 // Process a chunk of blocks
 async function indexNetworkChunk(network, fromBlock, toBlock) {
-  logger.info(`Processing chunk for ${network} from block ${fromBlock} to ${toBlock}`);
+  logger.infoIf(IS_DEV, `Processing chunk for ${network} from block ${fromBlock} to ${toBlock}`);
   
   try {
     // Start timer for performance metrics
@@ -799,7 +827,8 @@ async function indexNetworkChunk(network, fromBlock, toBlock) {
     const processingTime = Date.now() - startTime;
     metrics.processingTimeMs += processingTime;
     
-    logger.info(`Completed chunk processing for ${network}`, {
+    // Only log completion details if in dev mode
+    logger.infoIf(IS_DEV, `Completed chunk processing for ${network}`, {
       fromBlock,
       toBlock,
       processingTimeMs: processingTime
@@ -819,7 +848,7 @@ async function indexNetworkChunk(network, fromBlock, toBlock) {
 
 // Main indexing function with block range chunking
 async function indexNetwork(network, fromBlock, toBlock) {
-  logger.info(`Starting indexing for ${network} from block ${fromBlock} to ${toBlock}`);
+  logger.infoIf(IS_DEV, `Starting indexing for ${network} from block ${fromBlock} to ${toBlock}`);
   
   try {
     // Reset metrics for this run
@@ -830,14 +859,14 @@ async function indexNetwork(network, fromBlock, toBlock) {
     
     // Process in chunks if range is too large
     if (toBlock - fromBlock > MAX_BLOCK_RANGE) {
-      logger.info(`Large block range detected, breaking into chunks of ${MAX_BLOCK_RANGE} blocks`);
+      logger.infoIf(IS_DEV, `Large block range detected, breaking into chunks of ${MAX_BLOCK_RANGE} blocks`);
       
       const chunks = [];
       for (let i = fromBlock; i < toBlock; i += MAX_BLOCK_RANGE) {
         chunks.push([i, Math.min(i + MAX_BLOCK_RANGE - 1, toBlock)]);
       }
       
-      logger.info(`Created ${chunks.length} chunks for processing`);
+      logger.infoIf(IS_DEV, `Created ${chunks.length} chunks for processing`);
       
       let lastProcessedBlock = fromBlock;
       for (const [chunkFrom, chunkTo] of chunks) {
@@ -854,7 +883,13 @@ async function indexNetwork(network, fromBlock, toBlock) {
         [network, lastProcessedBlock]
       );
       
-      logger.info(`Completed chunked indexing for ${network}`, { metrics });
+      // Only log completion details if in dev mode or we found events
+      const foundEvents = 
+        metrics.eventsProcessed.campaigns > 0 || 
+        metrics.eventsProcessed.donations > 0 || 
+        metrics.eventsProcessed.withdrawals > 0;
+      
+      logger.infoIf(IS_DEV || foundEvents, `Completed chunked indexing for ${network}`, { metrics });
       
       return lastProcessedBlock;
     } else {
@@ -871,7 +906,13 @@ async function indexNetwork(network, fromBlock, toBlock) {
         [network, processedBlock]
       );
       
-      logger.info(`Completed indexing for ${network}`, { metrics });
+      // Only log completion details if in dev mode or we found events
+      const foundEvents = 
+        metrics.eventsProcessed.campaigns > 0 || 
+        metrics.eventsProcessed.donations > 0 || 
+        metrics.eventsProcessed.withdrawals > 0;
+      
+      logger.infoIf(IS_DEV || foundEvents, `Completed indexing for ${network}`, { metrics });
       
       return processedBlock;
     }
