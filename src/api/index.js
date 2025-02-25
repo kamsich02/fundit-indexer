@@ -30,6 +30,91 @@ app.get('/api/indexer-status', async (req, res) => {
   }
 });
 
+// NEW: Campaign search endpoint
+app.get('/api/campaigns/search', async (req, res) => {
+  try {
+    const query = req.query.query || '';
+    const limit = parseInt(req.query.limit) || 20;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
+    const ended = req.query.ended === 'true';
+    
+    // Check if the query is a pure numeric ID
+    const isPureNumeric = /^\d+$/.test(query.trim());
+    
+    let sqlQuery, queryParams;
+    
+    if (isPureNumeric) {
+      // Prioritize exact ID match first
+      const exactMatch = await db.query(
+        'SELECT * FROM campaigns WHERE id = $1',
+        [query.trim()]
+      );
+      
+      // If we found an exact ID match, return just that campaign
+      if (exactMatch.rows.length > 0) {
+        const campaigns = exactMatch.rows.map(formatCampaign);
+        
+        return res.json({
+          campaigns,
+          pagination: {
+            total: 1,
+            page: 1,
+            limit,
+            totalPages: 1
+          }
+        });
+      }
+    }
+    
+    // If no exact ID match or query is not numeric, perform text search
+    sqlQuery = `
+      SELECT * FROM campaigns 
+      WHERE ended = $1 AND (
+        CAST(id AS TEXT) ILIKE $2 OR
+        name ILIKE $2 OR 
+        description ILIKE $2
+      )
+      ORDER BY created_at DESC
+      LIMIT $3 OFFSET $4
+    `;
+    
+    queryParams = [ended, `%${query}%`, limit, offset];
+    
+    // Execute the search query
+    const result = await db.query(sqlQuery, queryParams);
+    
+    // Get total count for pagination
+    const countSql = `
+      SELECT COUNT(*) FROM campaigns 
+      WHERE ended = $1 AND (
+        CAST(id AS TEXT) ILIKE $2 OR
+        name ILIKE $2 OR 
+        description ILIKE $2
+      )
+    `;
+    
+    const countResult = await db.query(countSql, [ended, `%${query}%`]);
+    const total = parseInt(countResult.rows[0].count);
+    
+    // Format campaigns
+    const campaigns = result.rows.map(formatCampaign);
+    
+    res.json({
+      campaigns,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Error searching campaigns:', error);
+    res.status(500).json({ error: 'Failed to search campaigns' });
+  }
+});
+
 // Get all campaigns with pagination
 app.get('/api/campaigns', async (req, res) => {
   try {
@@ -37,6 +122,7 @@ app.get('/api/campaigns', async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const offset = (page - 1) * limit;
     const ended = req.query.ended === 'true';
+    const sort = req.query.sort || 'newest'; // Support sort parameter
     
     // Get total count
     const countResult = await db.query(
@@ -45,28 +131,20 @@ app.get('/api/campaigns', async (req, res) => {
     );
     const total = parseInt(countResult.rows[0].count);
     
+    // Determine sort order
+    const sortOrder = sort === 'newest' ? 'DESC' : 'ASC';
+    
     // Get campaigns
     const result = await db.query(
       `SELECT * FROM campaigns 
        WHERE ended = $1
-       ORDER BY created_at DESC
+       ORDER BY created_at ${sortOrder}
        LIMIT $2 OFFSET $3`,
       [ended, limit, offset]
     );
     
     // Format response
-    const campaigns = result.rows.map(row => ({
-      id: row.id,
-      title: row.name,
-      description: row.description,
-      image: `/assets/images/campaign-${row.image_id}.png`,
-      amountRaised: parseFloat(row.amount_raised),
-      targetAmount: parseFloat(row.target_amount),
-      createdAt: row.created_at,
-      status: row.ended ? 'Ended' : 'Ongoing',
-      creator: row.creator,
-      moreinfo: row.social_link
-    }));
+    const campaigns = result.rows.map(formatCampaign);
     
     res.json({
       campaigns,
@@ -95,21 +173,7 @@ app.get('/api/campaigns/:id', async (req, res) => {
       return res.status(404).json({ error: 'Campaign not found' });
     }
     
-    const row = result.rows[0];
-    
-    // Format campaign
-    const campaign = {
-      id: row.id,
-      title: row.name,
-      description: row.description,
-      image: `/assets/images/campaign-${row.image_id}.png`,
-      amountRaised: parseFloat(row.amount_raised),
-      targetAmount: parseFloat(row.target_amount),
-      createdAt: row.created_at,
-      status: row.ended ? 'Ended' : 'Ongoing',
-      creator: row.creator,
-      moreinfo: row.social_link
-    };
+    const campaign = formatCampaign(result.rows[0]);
     
     res.json(campaign);
   } catch (error) {
@@ -166,18 +230,7 @@ app.get('/api/user-campaigns/:address', async (req, res) => {
     );
     
     // Format campaigns
-    const campaigns = result.rows.map(row => ({
-      id: row.id,
-      title: row.name,
-      description: row.description,
-      image: `/assets/images/campaign-${row.image_id}.png`,
-      amountRaised: parseFloat(row.amount_raised),
-      targetAmount: parseFloat(row.target_amount),
-      createdAt: row.created_at,
-      status: row.ended ? 'Ended' : 'Ongoing',
-      creator: row.creator,
-      moreinfo: row.social_link
-    }));
+    const campaigns = result.rows.map(formatCampaign);
     
     res.json(campaigns);
   } catch (error) {
@@ -185,5 +238,21 @@ app.get('/api/user-campaigns/:address', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch user campaigns' });
   }
 });
+
+// Helper function to format campaign data
+function formatCampaign(row) {
+  return {
+    id: row.id,
+    title: row.name,
+    description: row.description,
+    image: row.image_id,
+    amountRaised: parseFloat(row.amount_raised),
+    targetAmount: parseFloat(row.target_amount),
+    createdAt: row.created_at,
+    status: row.ended ? 'Ended' : 'Ongoing',
+    creator: row.creator,
+    moreinfo: row.social_link
+  };
+}
 
 module.exports = app;
