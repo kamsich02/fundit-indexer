@@ -6,10 +6,13 @@ const blockchainService = require('./src/services/blockchain');
 // Number of blocks to process in each batch
 const BATCH_SIZE = 5000;
 
-// How far back to go for initial indexing (for chains with no indexing history)
-// 100,000 blocks is approximately 2 weeks for Ethereum (~13 seconds/block)
-// Adjust this value based on your needs and block times of different chains
-const INITIAL_HISTORY_BLOCKS = 100000;
+// How far back to go for initial indexing or jump-ahead
+// 100,000 blocks is approximately 2 weeks for Ethereum
+const RECENT_HISTORY_BLOCKS = 100000;
+
+// Maximum allowed gap between current block and last indexed
+// If gap is larger than this, we'll jump ahead to more recent blocks
+const MAX_ACCEPTABLE_GAP = 500000; // About 3-4 weeks for most chains
 
 // Initialize blockchain service
 function initializeServices() {
@@ -56,25 +59,44 @@ async function processNetworks() {
         const provider = providers[network];
         const currentBlock = await provider.getBlockNumber();
         
-        // Determine starting block - use last indexed, or start from recent history
+        // Determine starting block
         let fromBlock;
+        let jumpedAhead = false;
         
         if (lastIndexedBlocks[network] !== undefined) {
-          // We have indexed this chain before, start from the next block
-          fromBlock = lastIndexedBlocks[network] + 1;
+          // Calculate gap between current and last indexed
+          const gap = currentBlock - lastIndexedBlocks[network];
           
-          // Safety check - don't go beyond current block
-          if (fromBlock > currentBlock) {
-            console.log(`${network}: No new blocks to index (last indexed: ${lastIndexedBlocks[network]}, current: ${currentBlock})`);
-            continue;
+          // If gap is too large, jump ahead to more recent blocks
+          if (gap > MAX_ACCEPTABLE_GAP) {
+            const oldFromBlock = lastIndexedBlocks[network] + 1;
+            fromBlock = Math.max(1, currentBlock - RECENT_HISTORY_BLOCKS);
+            jumpedAhead = true;
+            
+            console.log(`${network}: Gap too large (${gap} blocks). Jumping ahead from block ${oldFromBlock} to ${fromBlock}`);
+            
+            // Update the last indexed block in database to reflect our jump
+            await db.query(
+              'UPDATE indexer_state SET last_indexed_block = $1, updated_at = NOW() WHERE chain = $2',
+              [fromBlock - 1, network]
+            );
+          } else {
+            // Normal case - continue from the next block
+            fromBlock = lastIndexedBlocks[network] + 1;
           }
         } else {
           // First time indexing this chain - start from recent history
-          fromBlock = Math.max(1, currentBlock - INITIAL_HISTORY_BLOCKS);
-          console.log(`${network}: First-time indexing, starting from block ${fromBlock} (${INITIAL_HISTORY_BLOCKS} blocks ago)`);
+          fromBlock = Math.max(1, currentBlock - RECENT_HISTORY_BLOCKS);
+          console.log(`${network}: First-time indexing, starting from block ${fromBlock} (${RECENT_HISTORY_BLOCKS} blocks ago)`);
         }
         
-        console.log(`${network}: Current block is ${currentBlock}, last indexed block is ${lastIndexedBlocks[network] || 'none'}`);
+        // Safety check - don't go beyond current block
+        if (fromBlock > currentBlock) {
+          console.log(`${network}: No new blocks to index (${jumpedAhead ? 'after jump-ahead' : `last indexed: ${lastIndexedBlocks[network]}`}, current: ${currentBlock})`);
+          continue;
+        }
+        
+        console.log(`${network}: Current block is ${currentBlock}, ${jumpedAhead ? 'jumped ahead to' : 'last indexed block is'} ${jumpedAhead ? fromBlock : lastIndexedBlocks[network] || 'none'}`);
         
         // Calculate batch size and end block
         const blocksToProcess = Math.min(currentBlock - fromBlock + 1, BATCH_SIZE);
