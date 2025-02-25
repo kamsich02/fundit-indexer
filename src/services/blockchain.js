@@ -178,10 +178,12 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
   }
   
   const contract = contracts[network];
-  const client = await db.query('BEGIN');
-  metrics.dbOperations++;
   
   try {
+    // Start transaction
+    await db.query('BEGIN');
+    metrics.dbOperations++;
+    
     // Fetch created events
     const createdFilter = contract.filters.CampaignCreated();
     const createdEvents = await withRetry(
@@ -289,7 +291,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
         createdParams.push(...values);
       });
       
-      await client.query(
+      await db.query(
         `INSERT INTO campaigns (
           id, name, description, target_amount, social_link, image_id, 
           creator, ended, amount_raised, chain, tx_hash
@@ -309,7 +311,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
         createdTxParams.push(...values);
       });
       
-      await client.query(
+      await db.query(
         `INSERT INTO transactions (
           type, user_address, campaign_id, timestamp, chain, tx_hash
         ) VALUES ${createdTxQueryParts.join(', ')}`,
@@ -330,7 +332,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
         continue;
       }
       
-      await client.query(
+      await db.query(
         `UPDATE campaigns SET
           name = $1,
           description = $2,
@@ -351,7 +353,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
       metrics.dbOperations++;
       
       // Record transaction
-      await client.query(
+      await db.query(
         `INSERT INTO transactions (
           type, user_address, campaign_id, timestamp, chain, tx_hash
         ) VALUES ($1, $2, $3, NOW(), $4, $5)`,
@@ -390,7 +392,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
     
     // Batch update campaigns
     for (const [finalAmount, campaignId] of endedValues) {
-      await client.query(
+      await db.query(
         `UPDATE campaigns SET
           ended = TRUE,
           amount_raised = $1,
@@ -412,7 +414,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
         endedTxParams.push(...values);
       });
       
-      await client.query(
+      await db.query(
         `INSERT INTO transactions (
           type, user_address, campaign_id, amount, timestamp, chain, tx_hash
         ) VALUES ${endedTxQueryParts.join(', ')}`,
@@ -422,7 +424,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
     }
     
     // Commit all changes
-    await client.query('COMMIT');
+    await db.query('COMMIT');
     metrics.dbOperations++;
     
     // Update metrics
@@ -431,7 +433,7 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
     logger.info(`Indexed ${createdEvents.length} created, ${editedEvents.length} edited, ${endedEvents.length} ended campaigns`);
     
   } catch (error) {
-    await client.query('ROLLBACK');
+    await db.query('ROLLBACK');
     metrics.dbOperations++;
     metrics.errors++;
     
@@ -452,10 +454,12 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
   logger.info(`Indexing ${network} donation events from ${fromBlock} to ${toBlock}`);
   
   const contract = contracts[network];
-  const client = await db.query('BEGIN');
-  metrics.dbOperations++;
   
   try {
+    // Start transaction
+    await db.query('BEGIN');
+    metrics.dbOperations++;
+    
     // Fetch donation events
     const donationFilter = contract.filters.DonationMade();
     const donationEvents = await withRetry(
@@ -523,7 +527,7 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
         donationParams.push(...values);
       });
       
-      await client.query(
+      await db.query(
         `INSERT INTO donations (
           campaign_id, donor, amount, timestamp, chain, tx_hash
         ) VALUES ${donationQueryParts.join(', ')}`,
@@ -534,7 +538,7 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
     
     // Update campaign amounts individually to ensure consistency
     for (const [amount, campaignId] of updateCampaignValues) {
-      await client.query(
+      await db.query(
         `UPDATE campaigns SET
           amount_raised = amount_raised + $1,
           updated_at = NOW()
@@ -555,7 +559,7 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
         txParams.push(...values);
       });
       
-      await client.query(
+      await db.query(
         `INSERT INTO transactions (
           type, user_address, campaign_id, amount, timestamp, chain, tx_hash
         ) VALUES ${txQueryParts.join(', ')}`,
@@ -565,7 +569,7 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
     }
     
     // Commit all changes
-    await client.query('COMMIT');
+    await db.query('COMMIT');
     metrics.dbOperations++;
     
     // Update metrics
@@ -574,7 +578,7 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
     logger.info(`Indexed ${donationEvents.length} donations`);
     
   } catch (error) {
-    await client.query('ROLLBACK');
+    await db.query('ROLLBACK');
     metrics.dbOperations++;
     metrics.errors++;
     
@@ -600,10 +604,12 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
   }
   
   const contract = contracts[network];
-  const client = await db.query('BEGIN');
-  metrics.dbOperations++;
   
   try {
+    // Start transaction
+    await db.query('BEGIN');
+    metrics.dbOperations++;
+    
     // Fetch withdrawal request events
     const requestFilter = contract.filters.WithdrawalRequested();
     const requestEvents = await withRetry(
@@ -668,7 +674,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
         requestParams.push(...values);
       });
       
-      await client.query(
+      await db.query(
         `INSERT INTO withdrawals (
           id, user_address, amount, token, target_chain, status, 
           request_timestamp, chain, tx_hash
@@ -690,7 +696,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
         requestTxParams.push(...values);
       });
       
-      await client.query(
+      await db.query(
         `INSERT INTO transactions (
           type, user_address, amount, token, target_chain, timestamp, chain, tx_hash
         ) VALUES ${requestTxQueryParts.join(', ')}`,
@@ -704,7 +710,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
       const requestId = event.args.requestId.toString();
       
       // Get withdrawal data for transaction log
-      const withdrawal = await client.query(
+      const withdrawal = await db.query(
         'SELECT * FROM withdrawals WHERE id = $1',
         [requestId]
       );
@@ -713,7 +719,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
       if (withdrawal.rows.length > 0) {
         const withdrawalData = withdrawal.rows[0];
         
-        await client.query(
+        await db.query(
           `UPDATE withdrawals SET
             status = $1,
             processed_timestamp = NOW(),
@@ -724,7 +730,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
         metrics.dbOperations++;
         
         // Record transaction
-        await client.query(
+        await db.query(
           `INSERT INTO transactions (
             type, user_address, amount, token, target_chain, timestamp, chain, tx_hash
           ) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)`,
@@ -743,7 +749,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
     }
     
     // Commit all changes
-    await client.query('COMMIT');
+    await db.query('COMMIT');
     metrics.dbOperations++;
     
     // Update metrics
@@ -752,7 +758,7 @@ async function indexWithdrawalEvents(network, fromBlock, toBlock) {
     logger.info(`Indexed ${requestEvents.length} withdrawal requests, ${processedEvents.length} processed withdrawals`);
     
   } catch (error) {
-    await client.query('ROLLBACK');
+    await db.query('ROLLBACK');
     metrics.dbOperations++;
     metrics.errors++;
     
