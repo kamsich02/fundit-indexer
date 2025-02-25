@@ -1,6 +1,6 @@
 // worker.js
 require('dotenv').config();
-const db = require('./src/db')
+const db = require('./src/db');
 const blockchainService = require('./src/services/blockchain');
 
 // Number of blocks to process in each batch
@@ -28,10 +28,6 @@ async function processNetworks() {
     if (!initialized) {
       throw new Error('Failed to initialize services');
     }
-    
-    // Connect to database
-    await db.connect();
-    console.log(`Database connected: ${new Date().toISOString()}`);
     
     // Get last indexed blocks
     const result = await db.query('SELECT chain, last_indexed_block FROM indexer_state');
@@ -82,14 +78,6 @@ async function processNetworks() {
   } catch (error) {
     console.error('Indexing process failed:', error);
     throw error;
-  } finally {
-    // Cleanup
-    try {
-      await db.end();
-      console.log('Database connection closed');
-    } catch (err) {
-      console.error('Error closing database connection:', err);
-    }
   }
 }
 
