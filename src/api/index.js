@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const db = require('../db');
-const { getIndexerStatus } = require('../worker');
+const { getIndexerStatus } = require('../../worker');
 
 const app = express();
 
