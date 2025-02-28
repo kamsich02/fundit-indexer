@@ -47,7 +47,6 @@ function initializeServices() {
     return false;
   }
 }
-
 async function processNetworks() {
   startTime = Date.now();
   log('Starting indexing process...', 'info', LOG_STATS_ONLY);
@@ -82,6 +81,13 @@ async function processNetworks() {
       // Skip networks without providers
       if (!providers[network]) {
         log(`Provider for ${network} is not available, skipping...`, 'info', VERBOSE_LOGGING);
+        continue;
+      }
+      
+      // For non-main chains, skip completely since we only care about main chain events
+      if (!config.isMain) {
+        log(`${network} is not the main chain, skipping completely`, 'info', VERBOSE_LOGGING);
+        networksProcessed++;
         continue;
       }
       

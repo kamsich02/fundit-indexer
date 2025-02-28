@@ -476,6 +476,12 @@ async function indexCampaignEvents(network, fromBlock, toBlock) {
 
 // Donation indexing
 async function indexDonationEvents(network, fromBlock, toBlock) {
+  // Skip non-main chains for donations
+  if (!NETWORKS[network].isMain) {
+    logger.infoIf(IS_DEV, `Skipping donation indexing for non-main chain ${network}`);
+    return;
+  }
+  
   logger.infoIf(IS_DEV, `Indexing ${network} donation events from ${fromBlock} to ${toBlock}`);
   
   const contract = contracts[network];
@@ -501,18 +507,11 @@ async function indexDonationEvents(network, fromBlock, toBlock) {
     const transactionValues = [];
     
     for (const event of donationEvents) {
-      const args = NETWORKS[network].isMain 
-        ? { 
-            campaignId: event.args.campaignId.toString(),
-            donor: event.args.donor,
-            netUSDValue: event.args.netUSDValue
-          }
-        : { 
-            donationId: event.args.donationId.toString(),
-            campaignId: event.args.campaignId.toString(),
-            donor: event.args.donor,
-            netUSDValue: event.args.netUSDValue
-          };
+      const args = { 
+        campaignId: event.args.campaignId.toString(),
+        donor: event.args.donor,
+        netUSDValue: event.args.netUSDValue
+      };
       
       const campaignId = args.campaignId;
       const donor = args.donor;
@@ -815,8 +814,10 @@ async function indexNetworkChunk(network, fromBlock, toBlock) {
       await indexCampaignEvents(network, fromBlock, toBlock);
     }
     
-    // Index donation events (for all chains)
-    await indexDonationEvents(network, fromBlock, toBlock);
+    // Index donation events (only for main chain)
+    if (NETWORKS[network].isMain) {
+      await indexDonationEvents(network, fromBlock, toBlock);
+    }
     
     // Index withdrawal events (only for main chain)
     if (NETWORKS[network].isMain) {
