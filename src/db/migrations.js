@@ -32,7 +32,9 @@ async function runMigrations() {
   
   const migrations = [
     { name: '001_initial_schema', up: require('../../migrations/001_initial_schema').up },
-    { name: '002_reconciliation_table.js', up: require('../../migrations/002_reconciliation_table.js').up }
+    { name: '002_reconciliation_table', up: require('../../migrations/002_reconciliation_table.js').up },
+    { name: '003_campaign_wallets', up: require('../../migrations/003_campaign_wallets.js').up },
+    { name: '004_direct_donations', up: require('../../migrations/004_direct_donations.js').up }
   ];
   
   for (const migration of migrations) {

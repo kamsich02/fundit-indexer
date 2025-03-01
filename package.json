@@ -8,7 +8,8 @@
   "worker": "node worker.js",
   "migrate": "node migrations/runner.js",
   "dev": "nodemon index.js",
-  "reconcile": "node scripts/reconcile.js"
+  "reconcile": "node scripts/reconcile.js",
+  "monitor-donations": "node scripts/monitor-donations.js"
 },
   "dependencies": {
     "cors": "^2.8.5",

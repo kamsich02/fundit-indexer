@@ -4,6 +4,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const db = require('../db');
 const { getIndexerStatus } = require('../../worker');
+const { generateCampaignWallet } = require('../services/walletGenerator');
 
 const app = express();
 
@@ -254,5 +255,79 @@ function formatCampaign(row) {
     moreinfo: row.social_link
   };
 }
+
+// Get direct donation wallet for a campaign
+app.get('/api/campaigns/:id/direct-wallet', async (req, res) => {
+  try {
+    // Check if campaign exists
+    const campaignResult = await db.query(
+      'SELECT * FROM campaigns WHERE id = $1',
+      [req.params.id]
+    );
+    
+    if (campaignResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    
+    // Check if wallet already exists for this campaign
+    const walletResult = await db.query(
+      'SELECT wallet_address FROM campaign_wallets WHERE campaign_id = $1',
+      [req.params.id]
+    );
+    
+    if (walletResult.rows.length > 0) {
+      // Return existing wallet
+      return res.json({
+        campaign_id: req.params.id,
+        wallet_address: walletResult.rows[0].wallet_address,
+        network: 'polygon',
+        token: 'POL'
+      });
+    }
+    
+    // Generate a new wallet for this campaign
+    const masterSeed = process.env.WALLET_MASTER_SEED;
+    if (!masterSeed) {
+      return res.status(500).json({ error: 'Wallet generation not configured' });
+    }
+    
+    const wallet = generateCampaignWallet(req.params.id, masterSeed);
+    
+    // Save to database (including private key)
+    await db.query(
+      'INSERT INTO campaign_wallets (campaign_id, wallet_address, private_key) VALUES ($1, $2, $3)',
+      [req.params.id, wallet.address, wallet.privateKey]
+    );
+    
+    // Return wallet (without private key)
+    res.json({
+      campaign_id: req.params.id,
+      wallet_address: wallet.address,
+      network: 'polygon',
+      token: 'MATIC'
+    });
+  } catch (error) {
+    console.error('Error generating campaign wallet:', error);
+    res.status(500).json({ error: 'Failed to generate wallet' });
+  }
+});
+
+// Get direct donations for a campaign
+app.get('/api/campaigns/:id/direct-donations', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, amount, status, source_tx_hash, contract_tx_hash, created_at, processed_at
+       FROM direct_donations
+       WHERE campaign_id = $1
+       ORDER BY created_at DESC`,
+      [req.params.id]
+    );
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error getting direct donations:', error);
+    res.status(500).json({ error: 'Failed to fetch direct donations' });
+  }
+});
 
 module.exports = app;
