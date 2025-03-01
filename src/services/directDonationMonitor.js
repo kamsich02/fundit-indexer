@@ -4,13 +4,14 @@ const db = require('../db');
 const { providers, contracts, NETWORKS } = require('./blockchain');
 const { createLogger, format, transports } = require('winston');
 
-// Logger configuration
+/**
+ * Logger configuration - only log important information
+ */
 const logger = createLogger({
   level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
   format: format.combine(
     format.timestamp(),
     format.errors({ stack: true }),
-    format.splat(),
     format.json()
   ),
   defaultMeta: { service: 'direct-donation-monitor' },
@@ -19,7 +20,9 @@ const logger = createLogger({
       format: format.combine(
         format.colorize(),
         format.printf(({ level, message, timestamp, service, ...meta }) => {
-          const metaStr = Object.keys(meta).length ? JSON.stringify(meta) : '';
+          // Only include metadata for errors and warnings
+          const metaStr = (level === 'error' || level === 'warn') && Object.keys(meta).length ? 
+            JSON.stringify(meta) : '';
           return `${timestamp} [${service}] ${level}: ${message} ${metaStr}`;
         })
       )
@@ -28,64 +31,109 @@ const logger = createLogger({
   ]
 });
 
-// Constants
-const POLL_INTERVAL = 60000; // Check every minute
-const MIN_BLOCK_CONFIRMATIONS = 5; // Wait for 5 block confirmations
-const GAS_PERCENTAGE = 20; // Reserve 20% of funds for gas
-const STABLE_TOKEN_DECIMALS = 8;
-const BALANCE_THRESHOLD_MATIC = 1; // Only process wallets with at least 1 MATIC
-const TX_TIMEOUT = 120000; // 2 minutes timeout for transaction confirmation
+// Configuration constants
+const CONFIG = {
+  // Monitoring intervals
+  BALANCE_CHECK_INTERVAL: 60 * 1000, // 1 minute
+  TRANSACTION_CHECK_INTERVAL: 2 * 60 * 1000, // 2 minutes
+  
+  // Donation parameters
+  MIN_DONATION_MATIC: 0.5,     // Minimum donation amount in MATIC
+  GAS_RESERVE_PERCENT: 35,     // Percentage of balance to reserve for gas
+  GAS_PRICE_BOOST: 120,        // Percentage of network gas price to use (120% = higher priority)
+  GAS_LIMIT_BUFFER: 150,       // Percentage buffer on estimated gas (150% = 50% extra)
+  
+  // Timeouts and limits
+  RPC_RETRY_ATTEMPTS: 3,       // Number of times to retry failed RPC calls
+  RPC_RETRY_DELAY_MS: 1000,    // Base delay between retries (increases with each attempt)
+  TX_TIMEOUT_MINUTES: 30,      // How long to wait before considering a transaction timed out
+  MIN_BLOCKS_CONFIRMATIONS: 5, // Number of block confirmations to wait for
+  
+  // Cooldown to prevent duplicate processing
+  WALLET_COOLDOWN_MINUTES: 5   // Minimum time between processing the same wallet
+};
 
 /**
- * Start monitoring campaign wallets for direct donations.
+ * Helper function to retry failed RPC calls with exponential backoff
+ */
+async function withRetry(operation, name = 'RPC call') {
+  let lastError;
+  
+  for (let attempt = 1; attempt <= CONFIG.RPC_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      
+      if (attempt === CONFIG.RPC_RETRY_ATTEMPTS) {
+        // Only log the final failed attempt to reduce noise
+        logger.warn(`${name} failed after ${attempt} attempts: ${error.message}`);
+      }
+      
+      // Exponential backoff before retrying
+      if (attempt < CONFIG.RPC_RETRY_ATTEMPTS) {
+        await new Promise(resolve => 
+          setTimeout(resolve, CONFIG.RPC_RETRY_DELAY_MS * Math.pow(2, attempt - 1))
+        );
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
+/**
+ * Main entry point - starts the donation monitoring service
  */
 async function monitorDirectDonations() {
   logger.info('Starting direct donation monitor');
-
+  
   try {
-    // Get the main chain provider and contract (Polygon)
+    // Find the main chain configuration
     const mainChain = Object.keys(NETWORKS).find(network => NETWORKS[network].isMain);
     if (!mainChain || !providers[mainChain] || !contracts[mainChain]) {
       throw new Error('Main chain provider or contract not available');
     }
+    
     const provider = providers[mainChain];
     const mainContract = contracts[mainChain];
-
+    
     logger.info(`Using ${mainChain} as the main chain for donations`);
-
-    // Initial check for pending deposits
-    await checkForDeposits(provider);
-    // Process any pending donations
-    await processDirectDonations(provider, mainContract);
-    // Check for processing donations that need status updates
-    await updateProcessingDonations(provider);
-
-    // Set up recurring intervals:
+    
+    // Set up monitoring intervals
+    
+    // 1. Monitor wallet balances
     setInterval(async () => {
       try {
-        await checkForDeposits(provider);
+        await monitorWalletBalances(provider);
       } catch (error) {
-        logger.error('Error checking for deposits:', error);
+        logger.error('Error monitoring wallet balances:', error);
       }
-    }, POLL_INTERVAL);
-
+    }, CONFIG.BALANCE_CHECK_INTERVAL);
+    
+    // 2. Process pending donations
     setInterval(async () => {
       try {
-        await processDirectDonations(provider, mainContract);
+        await processPendingDonations(provider, mainContract);
       } catch (error) {
-        logger.error('Error processing donations:', error);
+        logger.error('Error processing pending donations:', error);
       }
-    }, POLL_INTERVAL * 2); // Process less frequently than checking
-
-    // Add interval for updating processing donations status
+    }, CONFIG.BALANCE_CHECK_INTERVAL);
+    
+    // 3. Check transaction status
     setInterval(async () => {
       try {
-        await updateProcessingDonations(provider);
+        await updateTransactionStatus(provider);
       } catch (error) {
-        logger.error('Error updating processing donations:', error);
+        logger.error('Error updating transaction status:', error);
       }
-    }, POLL_INTERVAL); 
-
+    }, CONFIG.TRANSACTION_CHECK_INTERVAL);
+    
+    // Initial run of all monitoring functions
+    await monitorWalletBalances(provider);
+    await processPendingDonations(provider, mainContract);
+    await updateTransactionStatus(provider);
+    
     logger.info('Direct donation monitor started successfully');
     return true;
   } catch (error) {
@@ -95,190 +143,248 @@ async function monitorDirectDonations() {
 }
 
 /**
- * Check campaign wallets for new deposits.
- * For each wallet, skip if:
- *   - Its balance is below the threshold (e.g. 1 MATIC)
- *   - There is already a pending or processing donation in the database.
- * Otherwise, record the donation as "pending".
+ * Step 1: Monitor wallet balances and create pending donations
+ * when significant deposits are detected.
  */
-async function checkForDeposits(provider) {
+async function monitorWalletBalances(provider) {
   try {
-    const walletsResult = await db.query('SELECT campaign_id, wallet_address FROM campaign_wallets');
-    if (walletsResult.rows.length === 0) {
-      logger.debug('No campaign wallets to monitor');
+    // Get all campaign wallets
+    const walletResult = await db.query(`
+      SELECT 
+        w.campaign_id, 
+        w.wallet_address,
+        (SELECT MAX(created_at) FROM direct_donations 
+         WHERE wallet_address = w.wallet_address AND status != 'failed') as last_donation_time
+      FROM campaign_wallets w
+    `);
+    
+    if (walletResult.rows.length === 0) {
       return;
     }
-
-    logger.info(`Checking ${walletsResult.rows.length} campaign wallets for new deposits`);
-
-    for (const wallet of walletsResult.rows) {
+    
+    for (const wallet of walletResult.rows) {
       try {
-        // Check if a donation for this wallet is already pending or processing
-        const pendingResult = await db.query(
-          `SELECT id FROM direct_donations 
-           WHERE wallet_address = $1 AND status IN ('pending', 'processing')
-           LIMIT 1`,
-          [wallet.wallet_address]
-        );
-        if (pendingResult.rows.length > 0) {
-          logger.debug(`Skipping wallet ${wallet.wallet_address} as it already has a pending donation.`);
+        // Check if this wallet has a donation in progress
+        const activeDonation = await db.query(`
+          SELECT id FROM direct_donations 
+          WHERE wallet_address = $1 AND status IN ('pending', 'processing')
+          LIMIT 1
+        `, [wallet.wallet_address]);
+        
+        if (activeDonation.rows.length > 0) {
+          // Skip wallets with active donations
           continue;
         }
-
-        // Get the wallet's current balance
-        const balance = await provider.getBalance(wallet.wallet_address);
+        
+        // Check cooldown period to prevent duplicate processing
+        if (wallet.last_donation_time) {
+          const cooldownMinutes = CONFIG.WALLET_COOLDOWN_MINUTES;
+          const cooldownExpiry = new Date(wallet.last_donation_time);
+          cooldownExpiry.setMinutes(cooldownExpiry.getMinutes() + cooldownMinutes);
+          
+          if (new Date() < cooldownExpiry) {
+            // Still in cooldown period, skip this wallet
+            continue;
+          }
+        }
+        
+        // Check current balance
+        const balance = await withRetry(
+          () => provider.getBalance(wallet.wallet_address),
+          `Get balance for ${wallet.wallet_address}`
+        );
+        
         const balanceEther = Number(ethers.formatEther(balance));
-        if (balanceEther < BALANCE_THRESHOLD_MATIC) {
-          logger.debug(`Skipping wallet ${wallet.wallet_address} for campaign ${wallet.campaign_id}: balance (${balanceEther} MATIC) is below threshold.`);
+        
+        // Skip if balance is below minimum donation threshold
+        if (balanceEther < CONFIG.MIN_DONATION_MATIC) {
           continue;
         }
-
-        logger.info(`Found balance: ${ethers.formatEther(balance)} MATIC in wallet ${wallet.wallet_address} for campaign ${wallet.campaign_id}`);
-
-        // Record the donation with status "pending"
-        await db.query(
-          `INSERT INTO direct_donations (
+        
+        // Get the most recent completed donation for this wallet
+        const previousDonation = await db.query(`
+          SELECT amount FROM direct_donations 
+          WHERE wallet_address = $1 AND status = 'completed'
+          ORDER BY processed_at DESC LIMIT 1
+        `, [wallet.wallet_address]);
+        
+        const previousAmount = previousDonation.rows.length > 0 ? 
+          ethers.parseEther(previousDonation.rows[0].amount) : 0n;
+        
+        // Only create a new donation if balance is significantly higher
+        // than the previous donation amount (add a small buffer to account for dust)
+        const minSignificantChange = ethers.parseEther("0.1");
+        
+        if (balance <= previousAmount + minSignificantChange) {
+          // Balance hasn't changed enough to warrant a new donation
+          continue;
+        }
+        
+        logger.info(`New donation detected: ${ethers.formatEther(balance)} MATIC in wallet ${wallet.wallet_address.substring(0, 8)}... for campaign ${wallet.campaign_id}`);
+        
+        // Create a new pending donation
+        await db.query(`
+          INSERT INTO direct_donations (
             campaign_id, wallet_address, amount, status, source_tx_hash, created_at
-          ) VALUES ($1, $2, $3, $4, $5, NOW())`,
-          [
-            wallet.campaign_id,
-            wallet.wallet_address,
-            ethers.formatEther(balance),
-            'pending',
-            `balance-check-${Date.now()}`
-          ]
-        );
+          ) VALUES ($1, $2, $3, $4, $5, NOW())
+        `, [
+          wallet.campaign_id,
+          wallet.wallet_address,
+          ethers.formatEther(balance),
+          'pending',
+          `balance-${Date.now()}`
+        ]);
       } catch (error) {
-        logger.error(`Error checking wallet ${wallet.wallet_address}:`, error);
+        logger.error(`Error monitoring wallet ${wallet.wallet_address}:`, error);
       }
     }
   } catch (error) {
-    logger.error('Error checking for deposits:', error);
+    logger.error('Error monitoring wallet balances:', error);
   }
 }
 
 /**
- * Process pending direct donations by calling the donation contract.
- * For each pending donation, re-check the wallet balance, estimate the gas cost,
- * and if the remaining balance (after subtracting gas) is sufficient, send the donation.
- * Then update the donation status in the database based on the transaction result.
+ * Step 2: Process pending donations by sending transactions
+ * to the main contract.
  */
-async function processDirectDonations(provider, mainContract) {
+async function processPendingDonations(provider, mainContract) {
   try {
-    const pendingResult = await db.query(
-      `SELECT d.id, d.campaign_id, d.wallet_address, d.amount, d.source_tx_hash, w.private_key
-       FROM direct_donations d
-       JOIN campaign_wallets w ON d.wallet_address = w.wallet_address
-       WHERE d.status = 'pending'
-       ORDER BY d.created_at ASC`
-    );
-
-    if (pendingResult.rows.length === 0) {
-      logger.debug('No pending donations to process');
+    // Get pending donations sorted by creation time (oldest first)
+    const pendingDonations = await db.query(`
+      SELECT 
+        d.id, 
+        d.campaign_id, 
+        d.wallet_address, 
+        d.amount, 
+        w.private_key
+      FROM direct_donations d
+      JOIN campaign_wallets w ON d.wallet_address = w.wallet_address
+      WHERE d.status = 'pending'
+      ORDER BY d.created_at ASC
+    `);
+    
+    if (pendingDonations.rows.length === 0) {
       return;
     }
-
-    logger.info(`Processing ${pendingResult.rows.length} pending donations`);
-
-    for (const donation of pendingResult.rows) {
+    
+    logger.info(`Processing ${pendingDonations.rows.length} pending donations`);
+    
+    for (const donation of pendingDonations.rows) {
       try {
-        // Double-check that the donation is still in pending status
-        const statusCheck = await db.query(
+        // Double-check that the donation is still pending
+        const currentStatus = await db.query(
           'SELECT status FROM direct_donations WHERE id = $1',
           [donation.id]
         );
         
-        if (statusCheck.rows.length === 0 || statusCheck.rows[0].status !== 'pending') {
-          logger.info(`Donation ${donation.id} is no longer in pending status, skipping`);
+        if (currentStatus.rows.length === 0 || currentStatus.rows[0].status !== 'pending') {
+          // Donation no longer pending, skip it
           continue;
         }
         
-        // Create a wallet instance using the stored private key
+        // Create wallet from private key
         const wallet = new ethers.Wallet(donation.private_key, provider);
-        // Re-check the current balance
-        const balance = await provider.getBalance(donation.wallet_address);
-
-        // Estimate gas for this donation transaction (using the full balance for estimation)
-        const gasEstimate = await mainContract.connect(wallet).donate.estimateGas(
-          donation.campaign_id,
-          ethers.ZeroAddress, // For native token donation
-          0,
-          { value: balance }
+        
+        // Check for pending transactions from this wallet
+        const pendingTxCount = await withRetry(
+          () => provider.getTransactionCount(wallet.address, 'pending'),
+          `Get pending tx count for ${wallet.address}`
         );
-
-        // Retrieve fee data and determine max fee per gas
-        const feeData = await provider.getFeeData();
-        const maxFeePerGas = feeData.maxFeePerGas || feeData.gasPrice;
-
-        // Calculate total gas cost with a 20% buffer for safety
-        const gasCost = gasEstimate * maxFeePerGas * BigInt(120) / BigInt(100);
-        // Calculate the donation amount: balance minus gas cost
-        const donationAmount = balance > gasCost ? balance - gasCost : BigInt(0);
-
-        // Skip donation if amount is too low (less than 0.0001 MATIC)
-        if (donationAmount <= ethers.parseEther("0.0001")) {
-          logger.warn(`Donation amount too small for donation ${donation.id}: ${ethers.formatEther(donationAmount)} POL`);
-          if (donationAmount <= BigInt(0)) {
-            await db.query(
-              `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
-              [donation.id]
-            );
-          }
+        
+        const confirmedTxCount = await withRetry(
+          () => provider.getTransactionCount(wallet.address, 'latest'),
+          `Get confirmed tx count for ${wallet.address}`
+        );
+        
+        if (pendingTxCount > confirmedTxCount) {
+          logger.info(`Skipping donation ${donation.id}: wallet has ${pendingTxCount - confirmedTxCount} pending transactions`);
           continue;
         }
-
-        logger.info(`Processing donation of ${ethers.formatEther(donationAmount)} POL for campaign ${donation.campaign_id}`);
-
-        // Send the donation transaction
-        const tx = await mainContract.connect(wallet).donate(
-          donation.campaign_id,
-          ethers.ZeroAddress,
-          0,
-          {
-            value: donationAmount,
-            maxFeePerGas: maxFeePerGas,
-            maxPriorityFeePerGas: feeData.maxPriorityFeePerGas || feeData.gasPrice,
-            gasLimit: gasEstimate * BigInt(120) / BigInt(100)
-          }
+        
+        // Check current wallet balance
+        const currentBalance = await withRetry(
+          () => provider.getBalance(wallet.address),
+          `Get current balance for ${wallet.address}`
         );
-
-        logger.info(`Donation transaction sent: ${tx.hash}`);
-
-        // Update the donation record to "processing" with the tx hash
+        
+        // Skip if balance is too low for a meaningful donation
+        if (currentBalance < ethers.parseEther("0.5")) {
+          logger.debug(`Skipping donation ${donation.id}: insufficient balance (${ethers.formatEther(currentBalance)} MATIC)`);
+          continue;
+        }
+        
+        // Calculate donation amount, reserving gas
+        const gasReserve = currentBalance * BigInt(CONFIG.GAS_RESERVE_PERCENT) / BigInt(100);
+        const donationAmount = currentBalance - gasReserve;
+        
+        if (donationAmount <= 0n) {
+          logger.warn(`Donation ${donation.id} has insufficient funds after gas reserve`);
+          await db.query(
+            `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
+            [donation.id]
+          );
+          continue;
+        }
+        
+        // Get current gas estimate with a safe value for estimation
+        const safeEstimationAmount = donationAmount;
+        
+        const gasEstimate = await withRetry(
+          () => mainContract.connect(wallet).donate.estimateGas(
+            donation.campaign_id,
+            ethers.ZeroAddress,
+            0,
+            { value: safeEstimationAmount }
+          ),
+          `Estimate gas for donation ${donation.id}`
+        );
+        
+        // Get current network gas prices
+        const feeData = await withRetry(
+          () => provider.getFeeData(),
+          `Get fee data for donation ${donation.id}`
+        );
+        
+        // Set higher gas price for faster confirmation
+        const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice) * 
+          BigInt(CONFIG.GAS_PRICE_BOOST) / BigInt(100);
+        
+        const maxPriorityFeePerGas = (feeData.maxPriorityFeePerGas || 
+          (feeData.maxFeePerGas ? feeData.maxFeePerGas / 2n : feeData.gasPrice)) * 
+          BigInt(CONFIG.GAS_PRICE_BOOST) / BigInt(100);
+        
+        // Add extra buffer to gas limit
+        const gasLimit = gasEstimate * BigInt(CONFIG.GAS_LIMIT_BUFFER) / BigInt(100);
+        
+        logger.info(`Sending donation ${donation.id}: ${ethers.formatEther(donationAmount)} MATIC to campaign ${donation.campaign_id}`);
+        
+        // Send the transaction
+        const tx = await withRetry(
+          () => mainContract.connect(wallet).donate(
+            donation.campaign_id,
+            ethers.ZeroAddress,
+            0,
+            {
+              value: donationAmount,
+              maxFeePerGas,
+              maxPriorityFeePerGas,
+              gasLimit
+            }
+          ),
+          `Send donation transaction for ${donation.id}`
+        );
+        
+        logger.info(`Donation ${donation.id} transaction sent: ${tx.hash}`);
+        
+        // Update donation status
         await db.query(
           `UPDATE direct_donations SET status = 'processing', contract_tx_hash = $1 WHERE id = $2`,
           [tx.hash, donation.id]
         );
-
-        // Wait for transaction confirmation with timeout
-        try {
-          const receipt = await Promise.race([
-            tx.wait(),
-            new Promise((_, reject) => 
-              setTimeout(() => reject(new Error('Transaction confirmation timeout')), TX_TIMEOUT)
-            )
-          ]);
-          
-          if (receipt.status === 1) {
-            logger.info(`Donation ${donation.id} successfully processed in tx ${tx.hash}`);
-            await db.query(
-              `UPDATE direct_donations SET status = 'completed', processed_at = NOW() WHERE id = $1`,
-              [donation.id]
-            );
-          } else {
-            logger.error(`Donation ${donation.id} failed in tx ${tx.hash}`);
-            await db.query(
-              `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
-              [donation.id]
-            );
-          }
-        } catch (timeoutError) {
-          // If timeout occurs, we leave the status as "processing" and will check it in updateProcessingDonations
-          logger.warn(`Timeout waiting for confirmation of tx ${tx.hash} for donation ${donation.id}`);
-        }
       } catch (error) {
         logger.error(`Error processing donation ${donation.id}:`, error);
-        // Mark donation as failed if any error occurs during processing
+        
+        // Mark as failed if processing failed
         await db.query(
           `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
           [donation.id]
@@ -286,64 +392,66 @@ async function processDirectDonations(provider, mainContract) {
       }
     }
   } catch (error) {
-    logger.error('Error processing direct donations:', error);
+    logger.error('Error processing pending donations:', error);
   }
 }
 
 /**
- * Check the status of donations marked as "processing" and update them.
- * This handles cases where a transaction was sent but our process didn't see the confirmation,
- * or where we hit a timeout waiting for confirmation.
+ * Step 3: Update the status of processing donations
+ * based on their transaction status on the blockchain.
  */
-async function updateProcessingDonations(provider) {
+async function updateTransactionStatus(provider) {
   try {
-    const processingResult = await db.query(
-      `SELECT id, contract_tx_hash 
-       FROM direct_donations 
-       WHERE status = 'processing' AND contract_tx_hash IS NOT NULL
-       ORDER BY created_at ASC`
-    );
+    // Get all processing donations
+    const processingDonations = await db.query(`
+      SELECT 
+        id, 
+        contract_tx_hash, 
+        EXTRACT(EPOCH FROM (NOW() - created_at)) as age_seconds
+      FROM direct_donations 
+      WHERE status = 'processing' AND contract_tx_hash IS NOT NULL
+    `);
     
-    if (processingResult.rows.length === 0) {
+    if (processingDonations.rows.length === 0) {
       return;
     }
     
-    logger.info(`Checking status of ${processingResult.rows.length} processing donations`);
-    
-    for (const donation of processingResult.rows) {
+    for (const donation of processingDonations.rows) {
       try {
-        // Skip if no transaction hash
         if (!donation.contract_tx_hash) continue;
         
-        // Get transaction receipt to check status
-        const receipt = await provider.getTransactionReceipt(donation.contract_tx_hash);
+        // Check transaction receipt
+        const receipt = await withRetry(
+          () => provider.getTransactionReceipt(donation.contract_tx_hash),
+          `Get transaction receipt for ${donation.contract_tx_hash}`
+        ).catch(() => null); // Silently catch errors and return null
         
-        // If receipt exists, update status based on success or failure
         if (receipt) {
+          // Transaction was mined
           if (receipt.status === 1) {
-            logger.info(`Donation ${donation.id} confirmed successful from tx ${donation.contract_tx_hash}`);
+            // Transaction successful
+            logger.info(`Donation ${donation.id} confirmed successfully in tx ${donation.contract_tx_hash.substring(0, 10)}...`);
+            
             await db.query(
               `UPDATE direct_donations SET status = 'completed', processed_at = NOW() WHERE id = $1`,
               [donation.id]
             );
           } else {
-            logger.error(`Donation ${donation.id} confirmed failed from tx ${donation.contract_tx_hash}`);
+            // Transaction failed
+            logger.warn(`Donation ${donation.id} failed in tx ${donation.contract_tx_hash.substring(0, 10)}...`);
+            
             await db.query(
               `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
               [donation.id]
             );
           }
         } else {
-          // No receipt yet - transaction still pending
-          // We could add logic here to time out very old transactions
-          const donationAge = await db.query(
-            `SELECT EXTRACT(EPOCH FROM (NOW() - created_at)) as age_seconds FROM direct_donations WHERE id = $1`,
-            [donation.id]
-          );
+          // No receipt yet - check if it's timed out
+          const timeoutSeconds = CONFIG.TX_TIMEOUT_MINUTES * 60;
           
-          // If processing for over 10 minutes with no receipt, mark as failed
-          if (donationAge.rows[0] && donationAge.rows[0].age_seconds > 600) {
-            logger.warn(`Donation ${donation.id} processing timed out after 10 minutes`);
+          if (donation.age_seconds > timeoutSeconds) {
+            logger.warn(`Donation ${donation.id} timed out after ${CONFIG.TX_TIMEOUT_MINUTES} minutes`);
+            
             await db.query(
               `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
               [donation.id]
@@ -351,11 +459,11 @@ async function updateProcessingDonations(provider) {
           }
         }
       } catch (error) {
-        logger.error(`Error checking status of donation ${donation.id}:`, error);
+        logger.error(`Error updating status for donation ${donation.id}:`, error);
       }
     }
   } catch (error) {
-    logger.error('Error updating processing donations:', error);
+    logger.error('Error updating transaction status:', error);
   }
 }
 
