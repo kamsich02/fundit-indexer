@@ -238,17 +238,21 @@ async function checkBalanceAndCreateDonation(wallet, provider, mainContract) {
     
     logger.info(`Sufficient balance (${balanceInMatic} MATIC) found in wallet ${wallet.wallet_address}`);
     
+    // Create a source_tx_hash placeholder since it's required (NOT NULL)
+    const sourceTxHash = `balance-check-${Date.now()}`;
+    
     // Create a new donation record
     const result = await db.query(`
       INSERT INTO direct_donations (
-        campaign_id, wallet_address, amount, status, created_at, check_count
-      ) VALUES ($1, $2, $3, $4, NOW(), 0)
+        campaign_id, wallet_address, amount, status, created_at, check_count, source_tx_hash
+      ) VALUES ($1, $2, $3, $4, NOW(), 0, $5)
       RETURNING id
     `, [
       wallet.campaign_id,
       wallet.wallet_address,
       balanceInMatic.toString(),
-      'pending'
+      'pending',
+      sourceTxHash
     ]);
     
     const donationId = result.rows[0].id;
