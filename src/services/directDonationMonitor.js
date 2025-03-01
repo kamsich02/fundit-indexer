@@ -99,52 +99,28 @@ async function checkForDeposits(provider) {
     
     logger.info(`Checking ${walletsResult.rows.length} campaign wallets for new deposits`);
     
-    // Get the current block number
-    const currentBlock = await provider.getBlockNumber();
-    
-    // Check deposit history for each wallet
+    // Check balances for each wallet
     for (const wallet of walletsResult.rows) {
       try {
-        // Get transaction history for this wallet
-        const history = await provider.getHistory(wallet.wallet_address);
+        // Check the wallet's current balance
+        const balance = await provider.getBalance(wallet.wallet_address);
         
-        // Filter for incoming transactions (where wallet is the 'to' address)
-        const incomingTxs = history.filter(tx => 
-          tx.to?.toLowerCase() === wallet.wallet_address.toLowerCase() && 
-          tx.value > 0
-        );
-        
-        // Process each incoming transaction
-        for (const tx of incomingTxs) {
-          // Check if we already recorded this transaction
-          const existingTx = await db.query(
-            'SELECT id FROM direct_donations WHERE source_tx_hash = $1',
-            [tx.hash]
-          );
+        // If there's a balance (MATIC), process it as a donation
+        if (balance > 0) {
+          logger.info(`Found balance: ${ethers.formatEther(balance)} MATIC in wallet ${wallet.wallet_address} for campaign ${wallet.campaign_id}`);
           
-          if (existingTx.rows.length > 0) {
-            continue; // Skip this transaction, already processed
-          }
-          
-          // Get more transaction details
-          const txDetails = await provider.getTransaction(tx.hash);
-          
-          // Make sure transaction is confirmed with enough blocks
-          if (currentBlock - txDetails.blockNumber < MIN_BLOCK_CONFIRMATIONS) {
-            logger.debug(`Transaction ${tx.hash} needs more confirmations, skipping for now`);
-            continue;
-          }
-          
-          // Record the new donation
-          const amount = ethers.formatEther(tx.value);
-          logger.info(`New donation detected: ${amount}POL to campaign ${wallet.campaign_id} in tx ${tx.hash}`);
-          
-          // Store in database
+          // Record the donation with the full balance amount
           await db.query(
             `INSERT INTO direct_donations (
               campaign_id, wallet_address, amount, status, source_tx_hash, created_at
             ) VALUES ($1, $2, $3, $4, $5, NOW())`,
-            [wallet.campaign_id, wallet.wallet_address, amount, 'pending', tx.hash]
+            [
+              wallet.campaign_id, 
+              wallet.wallet_address, 
+              ethers.formatEther(balance), 
+              'pending', 
+              `balance-check-${Date.now()}` // Simple placeholder
+            ]
           );
         }
       } catch (error) {
