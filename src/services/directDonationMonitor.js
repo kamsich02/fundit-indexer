@@ -292,15 +292,17 @@ async function monitorWalletBalances(provider) {
         );
         
         const balanceEther = Number(ethers.formatEther(balance));
+        logger.debug(`Wallet ${wallet.wallet_address} has balance: ${balanceEther} MATIC`);
         
         // Skip if balance is below minimum donation threshold
         if (balanceEther < CONFIG.MIN_DONATION_MATIC) {
+          logger.debug(`Wallet ${wallet.wallet_address} balance below threshold (${CONFIG.MIN_DONATION_MATIC} MATIC)`);
           continue;
         }
         
         // Get the most recent completed donation for this wallet
         const previousDonation = await db.query(`
-          SELECT amount FROM direct_donations 
+          SELECT amount, processed_at FROM direct_donations 
           WHERE wallet_address = $1 AND status = 'completed'
           ORDER BY processed_at DESC LIMIT 1
         `, [wallet.wallet_address]);
@@ -308,29 +310,34 @@ async function monitorWalletBalances(provider) {
         const previousAmount = previousDonation.rows.length > 0 ? 
           ethers.parseEther(previousDonation.rows[0].amount) : 0n;
         
-        // Only create a new donation if balance is significantly higher
-        // than the previous donation amount (add a small buffer to account for dust)
+        // Only create a new donation if:
+        // 1. There's no previous donation OR
+        // 2. Balance is significantly higher than previous donation
         const minSignificantChange = ethers.parseEther("0.05");
+        const hasSignificantChange = balance > previousAmount + minSignificantChange;
+        const isFirstDonation = previousDonation.rows.length === 0;
         
-        if (balance <= previousAmount + minSignificantChange) {
-          // Balance hasn't changed enough to warrant a new donation
-          continue;
+        logger.debug(`Wallet ${wallet.wallet_address} previous amount: ${ethers.formatEther(previousAmount)} MATIC, change threshold: ${ethers.formatEther(minSignificantChange)} MATIC`);
+        logger.debug(`Wallet ${wallet.wallet_address} has significant change: ${hasSignificantChange}, is first donation: ${isFirstDonation}`);
+        
+        if (isFirstDonation || hasSignificantChange) {
+          logger.info(`New donation detected: ${ethers.formatEther(balance)} MATIC in wallet ${wallet.wallet_address} for campaign ${wallet.campaign_id}`);
+          
+          // Create a new pending donation
+          await db.query(`
+            INSERT INTO direct_donations (
+              campaign_id, wallet_address, amount, status, source_tx_hash, created_at
+            ) VALUES ($1, $2, $3, $4, $5, NOW())
+          `, [
+            wallet.campaign_id,
+            wallet.wallet_address,
+            ethers.formatEther(balance),
+            'pending',
+            `balance-${Date.now()}`
+          ]);
+        } else {
+          logger.debug(`No significant balance change for wallet ${wallet.wallet_address}`);
         }
-        
-        logger.info(`New donation detected: ${ethers.formatEther(balance)} MATIC in wallet ${wallet.wallet_address.substring(0, 8)}... for campaign ${wallet.campaign_id}`);
-        
-        // Create a new pending donation
-        await db.query(`
-          INSERT INTO direct_donations (
-            campaign_id, wallet_address, amount, status, source_tx_hash, created_at
-          ) VALUES ($1, $2, $3, $4, $5, NOW())
-        `, [
-          wallet.campaign_id,
-          wallet.wallet_address,
-          ethers.formatEther(balance),
-          'pending',
-          `balance-${Date.now()}`
-        ]);
       } catch (error) {
         logger.error(`Error monitoring wallet ${wallet.wallet_address}:`, error);
       }
