@@ -29,7 +29,8 @@ const logger = createLogger({
 // Configuration
 const CONFIG = {
   MIN_DONATION_AMOUNT: 1.0, // Minimum donation in MATIC
-  GAS_RESERVE_PERCENT: 30,  // Percentage to reserve for gas
+  GAS_RESERVE_PERCENT: 10,  // Percentage to reserve for gas (reduced from 30%)
+  GAS_RESERVE_MIN: 0.05,    // Minimum gas reserve in MATIC
   MAX_PENDING_CHECKS: 15,   // Max number of times to check a pending tx before replacing
   CHECK_INTERVAL_MS: 60000, // Check every minute
   GAS_PRICE_BOOST: 120      // 20% boost for gas price 
@@ -280,9 +281,42 @@ async function sendDonationTransaction(donationId, wallet, provider, mainContrac
     // Create wallet instance
     const signer = new ethers.Wallet(wallet.private_key, provider);
     
-    // Calculate donation amount, reserving gas
-    const gasReserve = balance * BigInt(CONFIG.GAS_RESERVE_PERCENT) / BigInt(100);
-    const donationAmount = balance - gasReserve;
+    // First, get current gas prices and estimate
+    const feeData = await provider.getFeeData();
+    
+    // Use 20% higher gas price for faster confirmation
+    const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice) * 
+      BigInt(CONFIG.GAS_PRICE_BOOST) / BigInt(100);
+    
+    const maxPriorityFeePerGas = (feeData.maxPriorityFeePerGas || 
+      feeData.gasPrice / 2n) * BigInt(CONFIG.GAS_PRICE_BOOST) / BigInt(100);
+    
+    // Estimate gas with small test amount to avoid estimation failures
+    const testAmount = ethers.parseEther("0.1");
+    const gasEstimate = await mainContract.connect(signer).donate.estimateGas(
+      wallet.campaign_id,
+      ethers.ZeroAddress, // token address (zero for native token)
+      0, // token amount (0 when using native token)
+      { value: testAmount }
+    );
+    
+    // Add 30% buffer to gas limit for safety
+    const gasLimit = gasEstimate * 130n / 100n;
+    
+    // Calculate gas cost: gasLimit * gasPrice
+    const gasCost = gasLimit * (maxFeePerGas || feeData.gasPrice);
+    
+    // Add 50% buffer to gas cost estimation for safety
+    const gasCostWithBuffer = gasCost * 150n / 100n;
+    
+    logger.debug(`Estimated gas cost for donation ${donationId}: ${ethers.formatEther(gasCostWithBuffer)} MATIC`);
+    
+    // Ensure minimum reserve
+    const minReserve = ethers.parseEther("0.05");
+    const finalGasReserve = gasCostWithBuffer > minReserve ? gasCostWithBuffer : minReserve;
+    
+    // Calculate donation amount after subtracting gas costs
+    const donationAmount = balance - finalGasReserve;
     
     if (donationAmount <= 0n) {
       logger.warn(`Donation ${donationId} has insufficient funds after gas reserve`);
@@ -292,27 +326,6 @@ async function sendDonationTransaction(donationId, wallet, provider, mainContrac
       );
       return;
     }
-    
-    // Get gas estimate
-    const gasEstimate = await mainContract.connect(signer).donate.estimateGas(
-      wallet.campaign_id,
-      ethers.ZeroAddress, // token address (zero for native token)
-      0, // token amount (0 when using native token)
-      { value: donationAmount }
-    );
-    
-    // Get current gas prices
-    const feeData = await provider.getFeeData();
-    
-    // Prepare transaction with higher gas prices for faster confirmation
-    const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice) * 
-      BigInt(CONFIG.GAS_PRICE_BOOST) / BigInt(100);
-    
-    const maxPriorityFeePerGas = (feeData.maxPriorityFeePerGas || 
-      feeData.gasPrice / 2n) * BigInt(CONFIG.GAS_PRICE_BOOST) / BigInt(100);
-    
-    // Add buffer to gas limit
-    const gasLimit = gasEstimate * 130n / 100n; // 30% buffer
     
     logger.info(`Sending donation ${donationId}: ${ethers.formatEther(donationAmount)} MATIC to campaign ${wallet.campaign_id}`);
     
