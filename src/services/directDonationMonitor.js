@@ -5,7 +5,7 @@ const { providers, contracts, NETWORKS } = require('./blockchain');
 const { createLogger, format, transports } = require('winston');
 
 /**
- * Logger configuration - only log important information
+ * Logger configuration - improved format and detail
  */
 const logger = createLogger({
   level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
@@ -20,9 +20,10 @@ const logger = createLogger({
       format: format.combine(
         format.colorize(),
         format.printf(({ level, message, timestamp, service, ...meta }) => {
-          // Only include metadata for errors and warnings
-          const metaStr = (level === 'error' || level === 'warn') && Object.keys(meta).length ? 
-            JSON.stringify(meta) : '';
+          // Include metadata for all log levels in development, only errors in production
+          const isImportant = level === 'error' || level === 'warn';
+          const metaStr = (isImportant || process.env.NODE_ENV !== 'production') && 
+            Object.keys(meta).length ? JSON.stringify(meta) : '';
           return `${timestamp} [${service}] ${level}: ${message} ${metaStr}`;
         })
       )
@@ -34,23 +35,88 @@ const logger = createLogger({
 // Configuration constants
 const CONFIG = {
   // Monitoring intervals
-  BALANCE_CHECK_INTERVAL: 60 * 1000, // 1 minute
-  TRANSACTION_CHECK_INTERVAL: 2 * 60 * 1000, // 2 minutes
+  INITIAL_CHECK_DELAY_MS: 5000,      // Initial check after 5 seconds
+  BALANCE_CHECK_INTERVAL_MS: 30000,  // Check balances every 30 seconds
+  TX_CHECK_INTERVAL_MS: 60000,       // Check transactions every 1 minute
+  STUCK_TX_CHECK_INTERVAL_MS: 120000, // Check for stuck transactions every 2 minutes
   
   // Donation parameters
-  MIN_DONATION_MATIC: 0.5,     // Minimum donation amount in MATIC
-  GAS_RESERVE_PERCENT: 35,     // Percentage of balance to reserve for gas
-  GAS_PRICE_BOOST: 120,        // Percentage of network gas price to use (120% = higher priority)
-  GAS_LIMIT_BUFFER: 150,       // Percentage buffer on estimated gas (150% = 50% extra)
+  MIN_DONATION_MATIC: 0.3,           // Minimum donation amount in MATIC
+  GAS_RESERVE_PERCENT: 35,           // Percentage of balance to reserve for gas
+  GAS_PRICE_BOOST: 130,              // Percentage of network gas price to use (130% = higher priority)
+  GAS_LIMIT_BUFFER: 150,             // Percentage buffer on estimated gas (150% = 50% extra)
   
   // Timeouts and limits
-  RPC_RETRY_ATTEMPTS: 3,       // Number of times to retry failed RPC calls
-  RPC_RETRY_DELAY_MS: 1000,    // Base delay between retries (increases with each attempt)
-  TX_TIMEOUT_MINUTES: 30,      // How long to wait before considering a transaction timed out
-  MIN_BLOCKS_CONFIRMATIONS: 5, // Number of block confirmations to wait for
+  RPC_RETRY_ATTEMPTS: 3,             // Number of times to retry failed RPC calls
+  RPC_RETRY_DELAY_MS: 1000,          // Base delay between retries (increases with each attempt)
+  TX_TIMEOUT_MINUTES: 15,            // How long to wait before considering a transaction stuck
+  TX_FINAL_TIMEOUT_MINUTES: 30,      // How long to wait before considering a transaction failed
+  MIN_BLOCKS_CONFIRMATIONS: 3,       // Number of block confirmations to wait for
   
   // Cooldown to prevent duplicate processing
-  WALLET_COOLDOWN_MINUTES: 5   // Minimum time between processing the same wallet
+  WALLET_COOLDOWN_MINUTES: 3,        // Minimum time between processing the same wallet
+  
+  // Stuck transaction handling
+  STUCK_TX_RETRY_COUNT: 3,           // Number of times to retry a stuck transaction
+  STUCK_TX_GAS_BOOST: 150            // Percentage increase for gas price on retry (150% = 50% more)
+};
+
+// Store for transaction tracking
+const txTracker = {
+  // Track retries for stuck transactions
+  retryCount: new Map(),
+  
+  // Add a transaction to track
+  addTransaction(txHash, donationId) {
+    this.retryCount.set(txHash, {
+      donationId,
+      count: 0,
+      timestamp: Date.now()
+    });
+  },
+  
+  // Get transactions that might be stuck
+  getStuckTransactions(olderThanMinutes) {
+    const now = Date.now();
+    const threshold = olderThanMinutes * 60 * 1000;
+    
+    return Array.from(this.retryCount.entries())
+      .filter(([_, data]) => (now - data.timestamp) > threshold && data.count < CONFIG.STUCK_TX_RETRY_COUNT)
+      .map(([txHash, data]) => ({
+        txHash,
+        donationId: data.donationId,
+        count: data.count
+      }));
+  },
+  
+  // Increment retry count for a transaction
+  incrementRetryCount(txHash) {
+    const data = this.retryCount.get(txHash);
+    if (data) {
+      data.count++;
+      data.timestamp = Date.now();
+      this.retryCount.set(txHash, data);
+      return data.count;
+    }
+    return 0;
+  },
+  
+  // Remove a transaction from tracking
+  removeTransaction(txHash) {
+    this.retryCount.delete(txHash);
+  },
+  
+  // Clean up old transactions
+  cleanupOldTransactions() {
+    const now = Date.now();
+    const threshold = CONFIG.TX_FINAL_TIMEOUT_MINUTES * 60 * 1000;
+    
+    for (const [txHash, data] of this.retryCount.entries()) {
+      if ((now - data.timestamp) > threshold) {
+        this.retryCount.delete(txHash);
+      }
+    }
+  }
 };
 
 /**
@@ -65,9 +131,9 @@ async function withRetry(operation, name = 'RPC call') {
     } catch (error) {
       lastError = error;
       
-      if (attempt === CONFIG.RPC_RETRY_ATTEMPTS) {
-        // Only log the final failed attempt to reduce noise
-        logger.warn(`${name} failed after ${attempt} attempts: ${error.message}`);
+      // Only log if it's the last attempt or significant error
+      if (attempt === CONFIG.RPC_RETRY_ATTEMPTS || error.code !== 'SERVER_ERROR') {
+        logger.debug(`${name} failed (attempt ${attempt}/${CONFIG.RPC_RETRY_ATTEMPTS}): ${error.message}`);
       }
       
       // Exponential backoff before retrying
@@ -100,16 +166,28 @@ async function monitorDirectDonations() {
     
     logger.info(`Using ${mainChain} as the main chain for donations`);
     
-    // Set up monitoring intervals
+    // Run initial checks after a short delay to ensure DB connection is ready
+    setTimeout(async () => {
+      try {
+        logger.info('Running initial balance and transaction checks');
+        await monitorWalletBalances(provider);
+        await processPendingDonations(provider, mainContract);
+        await updateTransactionStatus(provider);
+      } catch (error) {
+        logger.error('Error during initial checks:', error);
+      }
+    }, CONFIG.INITIAL_CHECK_DELAY_MS);
     
-    // 1. Monitor wallet balances
+    // Set up recurring monitoring intervals
+    
+    // 1. Monitor wallet balances - more frequent checks
     setInterval(async () => {
       try {
         await monitorWalletBalances(provider);
       } catch (error) {
         logger.error('Error monitoring wallet balances:', error);
       }
-    }, CONFIG.BALANCE_CHECK_INTERVAL);
+    }, CONFIG.BALANCE_CHECK_INTERVAL_MS);
     
     // 2. Process pending donations
     setInterval(async () => {
@@ -118,7 +196,7 @@ async function monitorDirectDonations() {
       } catch (error) {
         logger.error('Error processing pending donations:', error);
       }
-    }, CONFIG.BALANCE_CHECK_INTERVAL);
+    }, CONFIG.BALANCE_CHECK_INTERVAL_MS);
     
     // 3. Check transaction status
     setInterval(async () => {
@@ -127,12 +205,17 @@ async function monitorDirectDonations() {
       } catch (error) {
         logger.error('Error updating transaction status:', error);
       }
-    }, CONFIG.TRANSACTION_CHECK_INTERVAL);
+    }, CONFIG.TX_CHECK_INTERVAL_MS);
     
-    // Initial run of all monitoring functions
-    await monitorWalletBalances(provider);
-    await processPendingDonations(provider, mainContract);
-    await updateTransactionStatus(provider);
+    // 4. Handle stuck transactions
+    setInterval(async () => {
+      try {
+        await handleStuckTransactions(provider, mainContract);
+        txTracker.cleanupOldTransactions();
+      } catch (error) {
+        logger.error('Error handling stuck transactions:', error);
+      }
+    }, CONFIG.STUCK_TX_CHECK_INTERVAL_MS);
     
     logger.info('Direct donation monitor started successfully');
     return true;
@@ -161,6 +244,8 @@ async function monitorWalletBalances(provider) {
     if (walletResult.rows.length === 0) {
       return;
     }
+    
+    logger.debug(`Checking balances for ${walletResult.rows.length} campaign wallets`);
     
     for (const wallet of walletResult.rows) {
       try {
@@ -213,7 +298,7 @@ async function monitorWalletBalances(provider) {
         
         // Only create a new donation if balance is significantly higher
         // than the previous donation amount (add a small buffer to account for dust)
-        const minSignificantChange = ethers.parseEther("0.1");
+        const minSignificantChange = ethers.parseEther("0.05");
         
         if (balance <= previousAmount + minSignificantChange) {
           // Balance hasn't changed enough to warrant a new donation
@@ -308,7 +393,7 @@ async function processPendingDonations(provider, mainContract) {
         );
         
         // Skip if balance is too low for a meaningful donation
-        if (currentBalance < ethers.parseEther("0.5")) {
+        if (currentBalance < ethers.parseEther("0.2")) {
           logger.debug(`Skipping donation ${donation.id}: insufficient balance (${ethers.formatEther(currentBalance)} MATIC)`);
           continue;
         }
@@ -376,6 +461,9 @@ async function processPendingDonations(provider, mainContract) {
         
         logger.info(`Donation ${donation.id} transaction sent: ${tx.hash}`);
         
+        // Add transaction to tracker
+        txTracker.addTransaction(tx.hash, donation.id);
+        
         // Update donation status
         await db.query(
           `UPDATE direct_donations SET status = 'processing', contract_tx_hash = $1 WHERE id = $2`,
@@ -432,6 +520,9 @@ async function updateTransactionStatus(provider) {
             // Transaction successful
             logger.info(`Donation ${donation.id} confirmed successfully in tx ${donation.contract_tx_hash.substring(0, 10)}...`);
             
+            // Remove from tracker
+            txTracker.removeTransaction(donation.contract_tx_hash);
+            
             await db.query(
               `UPDATE direct_donations SET status = 'completed', processed_at = NOW() WHERE id = $1`,
               [donation.id]
@@ -440,17 +531,23 @@ async function updateTransactionStatus(provider) {
             // Transaction failed
             logger.warn(`Donation ${donation.id} failed in tx ${donation.contract_tx_hash.substring(0, 10)}...`);
             
+            // Remove from tracker
+            txTracker.removeTransaction(donation.contract_tx_hash);
+            
             await db.query(
               `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
               [donation.id]
             );
           }
         } else {
-          // No receipt yet - check if it's timed out
-          const timeoutSeconds = CONFIG.TX_TIMEOUT_MINUTES * 60;
+          // No receipt yet - check if it's final timeout
+          const finalTimeoutSeconds = CONFIG.TX_FINAL_TIMEOUT_MINUTES * 60;
           
-          if (donation.age_seconds > timeoutSeconds) {
-            logger.warn(`Donation ${donation.id} timed out after ${CONFIG.TX_TIMEOUT_MINUTES} minutes`);
+          if (donation.age_seconds > finalTimeoutSeconds) {
+            logger.warn(`Donation ${donation.id} timed out after ${CONFIG.TX_FINAL_TIMEOUT_MINUTES} minutes`);
+            
+            // Remove from tracker
+            txTracker.removeTransaction(donation.contract_tx_hash);
             
             await db.query(
               `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
@@ -464,6 +561,134 @@ async function updateTransactionStatus(provider) {
     }
   } catch (error) {
     logger.error('Error updating transaction status:', error);
+  }
+}
+
+/**
+ * Step 4: Handle stuck transactions by replacing them with
+ * higher gas price transactions with the same nonce.
+ */
+async function handleStuckTransactions(provider, mainContract) {
+  try {
+    // Find transactions that might be stuck (older than TX_TIMEOUT_MINUTES)
+    const stuckTxs = txTracker.getStuckTransactions(CONFIG.TX_TIMEOUT_MINUTES);
+    
+    if (stuckTxs.length === 0) {
+      return;
+    }
+    
+    logger.info(`Found ${stuckTxs.length} potentially stuck transactions`);
+    
+    for (const stuckTx of stuckTxs) {
+      try {
+        // Check if transaction already confirmed but just missed in our checks
+        const receipt = await withRetry(
+          () => provider.getTransactionReceipt(stuckTx.txHash),
+          `Check receipt for stuck tx ${stuckTx.txHash}`
+        ).catch(() => null);
+        
+        if (receipt) {
+          // Transaction was actually mined, update its status
+          logger.info(`Stuck transaction ${stuckTx.txHash.substring(0, 10)}... was actually mined`);
+          
+          // Remove from tracker
+          txTracker.removeTransaction(stuckTx.txHash);
+          
+          // Update donation status based on receipt
+          if (receipt.status === 1) {
+            await db.query(
+              `UPDATE direct_donations SET status = 'completed', processed_at = NOW() WHERE id = $1`,
+              [stuckTx.donationId]
+            );
+          } else {
+            await db.query(
+              `UPDATE direct_donations SET status = 'failed', processed_at = NOW() WHERE id = $1`,
+              [stuckTx.donationId]
+            );
+          }
+          
+          continue;
+        }
+        
+        // Get the donation details
+        const donationResult = await db.query(`
+          SELECT d.campaign_id, d.wallet_address, w.private_key
+          FROM direct_donations d
+          JOIN campaign_wallets w ON d.wallet_address = w.wallet_address
+          WHERE d.id = $1 AND d.status = 'processing'
+        `, [stuckTx.donationId]);
+        
+        if (donationResult.rows.length === 0) {
+          // Donation no longer in processing state, remove from tracker
+          txTracker.removeTransaction(stuckTx.txHash);
+          continue;
+        }
+        
+        const donation = donationResult.rows[0];
+        
+        // Get the original transaction
+        const tx = await withRetry(
+          () => provider.getTransaction(stuckTx.txHash),
+          `Get stuck transaction ${stuckTx.txHash}`
+        ).catch(() => null);
+        
+        if (!tx) {
+          logger.warn(`Could not retrieve stuck transaction ${stuckTx.txHash.substring(0, 10)}...`);
+          continue;
+        }
+        
+        // Create wallet from private key
+        const wallet = new ethers.Wallet(donation.private_key, provider);
+        
+        // Get the nonce of the stuck transaction
+        const nonce = tx.nonce;
+        
+        // Get current gas prices
+        const feeData = await withRetry(
+          () => provider.getFeeData(),
+          `Get fee data for stuck tx ${stuckTx.txHash}`
+        );
+        
+        // Calculate higher gas price based on number of retries
+        const retryCount = txTracker.incrementRetryCount(stuckTx.txHash);
+        const boostMultiplier = CONFIG.STUCK_TX_GAS_BOOST + (retryCount * 20); // Increase by 20% more each retry
+        
+        const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice) * 
+          BigInt(boostMultiplier) / BigInt(100);
+        
+        const maxPriorityFeePerGas = (feeData.maxPriorityFeePerGas || 
+          (feeData.maxFeePerGas ? feeData.maxFeePerGas / 2n : feeData.gasPrice)) * 
+          BigInt(boostMultiplier) / BigInt(100);
+        
+        logger.info(`Replacing stuck tx ${stuckTx.txHash.substring(0, 10)}... (retry ${retryCount}) with higher gas price`);
+        
+        // Send empty transaction with same nonce and higher gas price
+        const replacementTx = await wallet.sendTransaction({
+          to: wallet.address, // Send to self
+          value: 0n,          // Zero value
+          nonce: nonce,       // Same nonce as stuck tx
+          maxFeePerGas,
+          maxPriorityFeePerGas,
+          gasLimit: 21000n    // Minimum gas for empty transaction
+        });
+        
+        logger.info(`Replacement tx sent: ${replacementTx.hash}`);
+        
+        // Update the donation record with the new tx hash
+        await db.query(
+          `UPDATE direct_donations SET contract_tx_hash = $1 WHERE id = $2`,
+          [replacementTx.hash, stuckTx.donationId]
+        );
+        
+        // Add new transaction to tracker and remove old one
+        txTracker.removeTransaction(stuckTx.txHash);
+        txTracker.addTransaction(replacementTx.hash, stuckTx.donationId);
+      } catch (error) {
+        logger.error(`Error handling stuck transaction ${stuckTx.txHash}:`, error);
+      }
+    }
+  } catch (error) {
+    logger.error('Error handling stuck transactions:', error);
   }
 }
 
