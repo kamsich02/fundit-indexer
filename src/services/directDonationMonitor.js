@@ -167,12 +167,24 @@ async function monitorDirectDonations() {
     logger.info(`Using ${mainChain} as the main chain for donations`);
     
     // Run initial checks after a short delay to ensure DB connection is ready
+// Add more detailed logging in the setTimeout function
     setTimeout(async () => {
       try {
         logger.info('Running initial balance and transaction checks');
+        
+        logger.debug('Checking wallet balances...');
         await monitorWalletBalances(provider);
+        logger.debug('Wallet balance checks completed');
+        
+        logger.debug('Processing pending donations...');
         await processPendingDonations(provider, mainContract);
+        logger.debug('Pending donation processing completed');
+        
+        logger.debug('Checking transaction status...');
         await updateTransactionStatus(provider);
+        logger.debug('Transaction status checks completed');
+        
+        logger.info('Initial checks completed successfully');
       } catch (error) {
         logger.error('Error during initial checks:', error);
       }
